@@ -1,0 +1,48 @@
+# Notes
+
+### 2026-09-09 — Git submodules, Phase 1 (read-only)
+
+Context: upstream jj-vcs/jj#494 has had no owner since 2023; the design docs
+(`docs/design/git-submodules.md`, `git-submodule-storage.md`) fix the bounds:
+phased roadmap, submodules as full jj repos in the `SubmoduleStore`, no
+workspace per submodule, all interaction through the superproject, warn-never-
+crash. Implemented the Phase 1 vertical slice within those bounds.
+
+Decisions:
+- `.gitmodules` parsed with `gix::submodule::File` (already a transitive dep via
+  gix `attributes`). Upstream removed its own parser in `fe9e71b90` for exactly
+  this reason; don't reintroduce one.
+- Store layout `.jj/repo/submodule_store/<percent-encoded name>`; names are
+  untrusted repo content so `/`, `..`, leading `.` are encoded.
+- Submodule repos created with `ReadonlyRepo::init` + `GitBackend::init_internal`
+  (no `Workspace`), fetched with the existing `GitFetch` pipeline with
+  `abandon_unreachable_commits: false` (superproject may reference commits on no
+  branch). Remote is always `origin`.
+- Working-copy population = one persisted `TreeState` per submodule under
+  `.jj/working_copy/submodules/<encoded path>`, rooted at the submodule dir and
+  backed by the submodule's store. Keyed by *path*, not name, so clearing needs
+  no name lookup. Clear-before / populate-after the superproject checkout is
+  essential: a cleared-too-late dir has no `.git` and no `GitSubmodule` file
+  state, so its files would be snapshotted as new superproject files.
+- `WorkingCopyFactory::{init,load}_working_copy` gained a `submodule_store`
+  param (only honest way to reach the store from the working copy). Two new
+  default-no-op `LockedWorkingCopy` methods: `populate_submodules`,
+  `clear_submodule` (used by `jj git submodule populate` and `delete`).
+- Misses (not cloned, commit not fetched) go to `CheckoutStats::skipped_submodules`
+  and print as warnings; the old `eprintln!("ignoring git submodule")` is gone.
+- `DefaultSubmoduleStore::load_repo` uses `default_backend_factories()` only
+  (ponytail: custom backends hosting submodules are hypothetical).
+
+Dead ends / gotchas:
+- `LockedWorkingCopy` is `#[async_trait]` (Send futures); holding `&self` of
+  `LockedLocalWorkingCopy` across an await fails because `OnceCell<TreeState>`
+  isn't Sync. Helpers that await take `&Store` instead.
+- `description('x')` in revsets is no longer a substring match; use bookmarks in
+  tests.
+- Populate must `create_dir_all` the submodule dir itself; `create_parent_dirs`
+  only makes parents of entries.
+
+Not done (next slice): auto-clone on `jj git clone`, auto-fetch on `jj git
+fetch`, `jj git submodule sync`, `jj status` integration, Phase 2 snapshotting
+(hook = nested `TreeState::snapshot`), gitlink conflict handling (#7806, #7386
+panic in builtin merge tool still open).

@@ -3391,6 +3391,13 @@ Discard the conflicting changes with `jj restore --from {}`.",
             short_commit_hash(new_commit.id())
         )?;
     }
+    for (path, reason) in &stats.skipped_submodules {
+        writeln!(
+            ui.warning_default(),
+            "Submodule at {path}: {reason}",
+            path = path.as_internal_file_string()
+        )?;
+    }
     Ok(())
 }
 

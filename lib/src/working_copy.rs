@@ -46,6 +46,7 @@ use crate::repo_path::RepoPath;
 use crate::repo_path::RepoPathBuf;
 use crate::settings::UserSettings;
 use crate::store::Store;
+use crate::submodule_store::SubmoduleStore;
 use crate::transaction::TransactionCommitError;
 
 /// The trait all working-copy implementations must implement.
@@ -85,6 +86,7 @@ impl dyn WorkingCopy {
 /// The factory which creates and loads a specific type of working copy.
 pub trait WorkingCopyFactory {
     /// Create a new working copy from scratch.
+    #[expect(clippy::too_many_arguments)]
     fn init_working_copy(
         &self,
         store: Arc<Store>,
@@ -93,6 +95,7 @@ pub trait WorkingCopyFactory {
         operation_id: OperationId,
         workspace_name: WorkspaceNameBuf,
         settings: &UserSettings,
+        submodule_store: Arc<dyn SubmoduleStore>,
     ) -> Result<Box<dyn WorkingCopy>, WorkingCopyStateError>;
 
     /// Load an existing working copy.
@@ -102,6 +105,7 @@ pub trait WorkingCopyFactory {
         working_copy_path: PathBuf,
         state_path: PathBuf,
         settings: &UserSettings,
+        submodule_store: Arc<dyn SubmoduleStore>,
     ) -> Result<Box<dyn WorkingCopy>, WorkingCopyStateError>;
 }
 
@@ -122,6 +126,17 @@ pub trait LockedWorkingCopy: Any + Send {
 
     /// Check out the specified commit in the working copy.
     async fn check_out(&mut self, commit: &Commit) -> Result<CheckoutStats, CheckoutError>;
+
+    /// Populates the directories of Git submodules whose repo and commit are
+    /// available in the submodule store, for the currently checked-out tree.
+    async fn populate_submodules(&mut self) -> Result<CheckoutStats, CheckoutError> {
+        Ok(CheckoutStats::default())
+    }
+
+    /// Removes the populated contents of the Git submodule at `path`.
+    async fn clear_submodule(&mut self, _path: &RepoPath) -> Result<CheckoutStats, CheckoutError> {
+        Ok(CheckoutStats::default())
+    }
 
     /// Update the workspace name.
     fn rename_workspace(&mut self, new_workspace_name: WorkspaceNameBuf);
@@ -269,6 +284,9 @@ pub struct CheckoutStats {
     /// working copy but were skipped because there was an untracked (probably
     /// ignored) file in its place.
     pub skipped_files: u32,
+    /// Git submodule directories that could not be populated, with the
+    /// reason (e.g. the submodule isn't cloned or its commit isn't fetched).
+    pub skipped_submodules: Vec<(RepoPathBuf, String)>,
 }
 
 /// The working-copy checkout failed.

@@ -581,12 +581,11 @@ fn test_submodule_ignored() {
 
     // This should be empty. We shouldn't track the submodule itself.
     let output = work_dir.run_jj(["diff", "--summary"]);
-    insta::assert_snapshot!(output, @r#"
+    insta::assert_snapshot!(output, @"
     ------- stderr -------
-    ignoring git submodule at "sub"
     Done importing changes from the underlying Git repo.
     [EOF]
-    "#);
+    ");
 
     // Switch to a historical commit before the submodule was checked in.
     work_dir.run_jj(["prev"]).success();

@@ -56,8 +56,12 @@ a comparison with Git, including how workflows are different, see the
   however.
 * **Bare repositories: Yes.** You can use `jj git init --git-repo=<path>` to
   create a repo backed by a bare Git repo.
-* **Submodules: No.** They will not show up in the working copy, but they will
-  not be lost either.
+* **Submodules: Partial (read-only, experimental).** Submodule repos can be
+  cloned into the jj repo with `jj git submodule clone --all`, after which
+  their contents are populated in the working copy on checkout. Changes made
+  inside a submodule directory are not snapshotted, and submodules stored this
+  way are not visible to Git in colocated repos. Without cloning, submodules
+  are empty directories that are not lost either.
 * **Partial clones: No.**
 * **Shallow clones: Kind of.** Shallow commits all have the virtual root commit
   as their parent. However, deepening or fully unshallowing a repository is

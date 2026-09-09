@@ -82,6 +82,7 @@ fn test_sparse_checkout() -> TestResult {
             added_files: 0,
             removed_files: 3,
             skipped_files: 0,
+            ..Default::default()
         }
     );
     assert_eq!(locked_ws.locked_wc().sparse_patterns()?, sparse_patterns);
@@ -131,6 +132,7 @@ fn test_sparse_checkout() -> TestResult {
         ws.workspace_root().to_path_buf(),
         wc.state_path().to_path_buf(),
         repo.settings(),
+        repo.submodule_store().clone(),
     )?;
     assert_eq!(
         wc.file_states()?.paths().collect_vec(),
@@ -151,6 +153,7 @@ fn test_sparse_checkout() -> TestResult {
             added_files: 2,
             removed_files: 2,
             skipped_files: 0,
+            ..Default::default()
         }
     );
     assert_eq!(locked_wc.sparse_patterns()?, sparse_patterns);

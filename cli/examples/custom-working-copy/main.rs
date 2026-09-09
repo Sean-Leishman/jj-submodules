@@ -36,6 +36,7 @@ use jj_lib::repo_path::RepoPathBuf;
 use jj_lib::settings::UserSettings;
 use jj_lib::signing_factory::signer_from_settings;
 use jj_lib::store::Store;
+use jj_lib::submodule_store::SubmoduleStore;
 use jj_lib::working_copy::CheckoutError;
 use jj_lib::working_copy::CheckoutStats;
 use jj_lib::working_copy::LockedWorkingCopy;
@@ -127,6 +128,7 @@ impl ConflictsWorkingCopy {
         operation_id: OperationId,
         workspace_name: WorkspaceNameBuf,
         user_settings: &UserSettings,
+        submodule_store: Arc<dyn SubmoduleStore>,
     ) -> Result<Self, WorkingCopyStateError> {
         let inner = LocalWorkingCopy::init(
             store,
@@ -135,6 +137,7 @@ impl ConflictsWorkingCopy {
             operation_id,
             workspace_name,
             user_settings,
+            submodule_store,
         )?;
         Ok(Self {
             inner: Box::new(inner),
@@ -147,9 +150,15 @@ impl ConflictsWorkingCopy {
         working_copy_path: PathBuf,
         state_path: PathBuf,
         user_settings: &UserSettings,
+        submodule_store: Arc<dyn SubmoduleStore>,
     ) -> Result<Self, WorkingCopyStateError> {
-        let inner =
-            LocalWorkingCopy::load(store, working_copy_path.clone(), state_path, user_settings)?;
+        let inner = LocalWorkingCopy::load(
+            store,
+            working_copy_path.clone(),
+            state_path,
+            user_settings,
+            submodule_store,
+        )?;
         Ok(Self {
             inner: Box::new(inner),
             working_copy_path,
@@ -199,6 +208,7 @@ impl WorkingCopyFactory for ConflictsWorkingCopyFactory {
         operation_id: OperationId,
         workspace_name: WorkspaceNameBuf,
         settings: &UserSettings,
+        submodule_store: Arc<dyn SubmoduleStore>,
     ) -> Result<Box<dyn WorkingCopy>, WorkingCopyStateError> {
         Ok(Box::new(ConflictsWorkingCopy::init(
             store,
@@ -207,6 +217,7 @@ impl WorkingCopyFactory for ConflictsWorkingCopyFactory {
             operation_id,
             workspace_name,
             settings,
+            submodule_store,
         )?))
     }
 
@@ -216,12 +227,14 @@ impl WorkingCopyFactory for ConflictsWorkingCopyFactory {
         working_copy_path: PathBuf,
         state_path: PathBuf,
         settings: &UserSettings,
+        submodule_store: Arc<dyn SubmoduleStore>,
     ) -> Result<Box<dyn WorkingCopy>, WorkingCopyStateError> {
         Ok(Box::new(ConflictsWorkingCopy::load(
             store,
             working_copy_path,
             state_path,
             settings,
+            submodule_store,
         )?))
     }
 }

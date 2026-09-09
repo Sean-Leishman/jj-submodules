@@ -86,7 +86,9 @@ pub fn default_backend_factories() -> StoreFactories {
     // SubmoduleStores
     factories.add_submodule_store(
         DefaultSubmoduleStore::NAME,
-        Box::new(|_settings, store_path| Ok(Box::new(DefaultSubmoduleStore::load(store_path)))),
+        Box::new(|settings, store_path| {
+            Ok(Box::new(DefaultSubmoduleStore::load(settings, store_path)))
+        }),
     );
 
     factories

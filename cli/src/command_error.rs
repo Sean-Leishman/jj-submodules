@@ -547,6 +547,8 @@ mod git {
     use jj_lib::git::GitRemoteManagementError;
     use jj_lib::git::GitResetHeadError;
     use jj_lib::git::UnexpectedGitBackendError;
+    use jj_lib::git_submodule::GitSubmoduleError;
+    use jj_lib::submodule_store::SubmoduleStoreError;
 
     use super::CommandError;
     use super::user_error;
@@ -626,6 +628,18 @@ jj currently does not support partial clones. To use jj with this repository, tr
                 GitPushError::Subprocess(_) => user_error(err),
                 GitPushError::UnexpectedBackend(_) => user_error(err),
             }
+        }
+    }
+
+    impl From<GitSubmoduleError> for CommandError {
+        fn from(err: GitSubmoduleError) -> Self {
+            user_error(err)
+        }
+    }
+
+    impl From<SubmoduleStoreError> for CommandError {
+        fn from(err: SubmoduleStoreError) -> Self {
+            user_error(err)
         }
     }
 

@@ -684,7 +684,8 @@ fn test_conflicting_changes_on_disk() -> TestResult {
             updated_files: 0,
             added_files: 3,
             removed_files: 0,
-            skipped_files: 3
+            skipped_files: 3,
+            ..Default::default()
         }
     );
 
@@ -805,6 +806,7 @@ fn test_checkout_discard() -> TestResult {
         workspace_root.clone(),
         state_path.clone(),
         repo.settings(),
+        repo.submodule_store().clone(),
     )?;
     assert!(reloaded_wc.file_states()?.contains_path(file1_path));
     assert!(!reloaded_wc.file_states()?.contains_path(file2_path));
@@ -816,8 +818,13 @@ fn test_checkout_discard() -> TestResult {
     assert!(!wc.file_states()?.contains_path(file2_path));
     assert!(!file1_path.to_fs_path_unchecked(&workspace_root).is_file());
     assert!(file2_path.to_fs_path_unchecked(&workspace_root).is_file());
-    let reloaded_wc =
-        LocalWorkingCopy::load(store.clone(), workspace_root, state_path, repo.settings())?;
+    let reloaded_wc = LocalWorkingCopy::load(
+        store.clone(),
+        workspace_root,
+        state_path,
+        repo.settings(),
+        repo.submodule_store().clone(),
+    )?;
     assert!(reloaded_wc.file_states()?.contains_path(file1_path));
     assert!(!reloaded_wc.file_states()?.contains_path(file2_path));
     Ok(())
@@ -908,7 +915,8 @@ fn test_materialize_snapshot_conflicted_files() -> TestResult {
             updated_files: 0,
             added_files: 2,
             removed_files: 0,
-            skipped_files: 0
+            skipped_files: 0,
+            ..Default::default()
         }
     );
 

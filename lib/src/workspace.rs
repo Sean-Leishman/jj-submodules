@@ -155,6 +155,7 @@ async fn init_working_copy(
         repo.op_id().clone(),
         workspace_name,
         repo.settings(),
+        repo.submodule_store().clone(),
     )?;
     let working_copy_type_path = working_copy_state_path.join("type");
     fs::write(&working_copy_type_path, working_copy.name()).context(&working_copy_type_path)?;
@@ -621,6 +622,7 @@ impl WorkspaceLoader for DefaultWorkspaceLoader {
             self.workspace_root.clone(),
             self.working_copy_state_path.clone(),
             user_settings,
+            repo_loader.submodule_store().clone(),
         )?;
         let workspace = Workspace::new(
             &self.workspace_root,

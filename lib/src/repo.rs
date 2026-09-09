@@ -209,7 +209,7 @@ impl ReadonlyRepo {
     }
 
     pub fn default_submodule_store_initializer() -> &'static SubmoduleStoreInitializer<'static> {
-        &|_settings, store_path| Ok(Box::new(DefaultSubmoduleStore::init(store_path)))
+        &|settings, store_path| Ok(Box::new(DefaultSubmoduleStore::init(settings, store_path)))
     }
 
     #[expect(clippy::too_many_arguments)]

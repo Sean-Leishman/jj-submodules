@@ -63,6 +63,7 @@ use tracing::instrument;
 use tracing::trace_span;
 
 use crate::backend::BackendError;
+use crate::backend::CommitId;
 use crate::backend::CopyId;
 use crate::backend::FileId;
 use crate::backend::MergedTreeValue;
@@ -118,6 +119,7 @@ use crate::repo_path::RepoPathBuf;
 use crate::repo_path::RepoPathComponent;
 use crate::settings::UserSettings;
 use crate::store::Store;
+use crate::submodule_store::SubmoduleStore;
 use crate::working_copy::CheckoutError;
 use crate::working_copy::CheckoutStats;
 use crate::working_copy::LockedWorkingCopy;
@@ -2323,6 +2325,7 @@ impl TreeState {
             added_files: added_stats.added_files,
             removed_files: removed_stats.removed_files,
             skipped_files: added_stats.skipped_files,
+            skipped_submodules: vec![],
         })
     }
 
@@ -2339,6 +2342,7 @@ impl TreeState {
             added_files: 0,
             removed_files: 0,
             skipped_files: 0,
+            skipped_submodules: vec![],
         };
         let mut changed_file_states = Vec::new();
         let mut deleted_files = HashSet::new();
@@ -2366,7 +2370,6 @@ impl TreeState {
             if matches!(before.as_normal(), Some(TreeValue::GitSubmodule(_)))
                 && matches!(after, MaterializedTreeValue::GitSubmodule(_))
             {
-                eprintln!("ignoring git submodule at {path:?}");
                 // Not updating the file state as if there were no diffs. Leave
                 // the state type as FileType::GitSubmodule if it was before.
                 return Ok(());
@@ -2492,7 +2495,6 @@ impl TreeState {
                     }
                 }
                 MaterializedTreeValue::GitSubmodule(_) => {
-                    eprintln!("ignoring git submodule at {path:?}");
                     // Git behavior: Create the submodule directory but don't
                     // populate/overwrite the contents.
                     match fs::create_dir(&disk_path) {
@@ -2625,10 +2627,7 @@ impl TreeState {
                             FileType::Normal { exec_bit }
                         }
                         TreeValue::Symlink(_id) => FileType::Symlink,
-                        TreeValue::GitSubmodule(_id) => {
-                            eprintln!("ignoring git submodule at {path:?}");
-                            FileType::GitSubmodule
-                        }
+                        TreeValue::GitSubmodule(_id) => FileType::GitSubmodule,
                         TreeValue::Tree(_id) => {
                             panic!("unexpected tree entry in diff at {path:?}");
                         }
@@ -2735,6 +2734,7 @@ pub struct LocalWorkingCopy {
     checkout_state: CheckoutState,
     tree_state: OnceCell<TreeState>,
     tree_state_settings: TreeStateSettings,
+    submodule_store: Arc<dyn SubmoduleStore>,
 }
 
 #[async_trait(?Send)]
@@ -2777,6 +2777,7 @@ impl WorkingCopy for LocalWorkingCopy {
             // hasn't changed.
             tree_state: OnceCell::new(),
             tree_state_settings: self.tree_state_settings.clone(),
+            submodule_store: self.submodule_store.clone(),
         };
         let old_operation_id = wc.operation_id().clone();
         let old_tree = wc.tree()?.clone();
@@ -2804,6 +2805,7 @@ impl LocalWorkingCopy {
         operation_id: OperationId,
         workspace_name: WorkspaceNameBuf,
         user_settings: &UserSettings,
+        submodule_store: Arc<dyn SubmoduleStore>,
     ) -> Result<Self, WorkingCopyStateError> {
         let checkout_state = CheckoutState {
             operation_id,
@@ -2832,6 +2834,7 @@ impl LocalWorkingCopy {
             checkout_state,
             tree_state: OnceCell::with_value(tree_state),
             tree_state_settings,
+            submodule_store,
         })
     }
 
@@ -2840,6 +2843,7 @@ impl LocalWorkingCopy {
         working_copy_path: PathBuf,
         state_path: PathBuf,
         user_settings: &UserSettings,
+        submodule_store: Arc<dyn SubmoduleStore>,
     ) -> Result<Self, WorkingCopyStateError> {
         let checkout_state = CheckoutState::load(&state_path)?;
         let tree_state_settings = TreeStateSettings::try_from_user_settings(user_settings)
@@ -2854,6 +2858,7 @@ impl LocalWorkingCopy {
             checkout_state,
             tree_state: OnceCell::new(),
             tree_state_settings,
+            submodule_store,
         })
     }
 
@@ -2926,6 +2931,7 @@ impl WorkingCopyFactory for LocalWorkingCopyFactory {
         operation_id: OperationId,
         workspace_name: WorkspaceNameBuf,
         settings: &UserSettings,
+        submodule_store: Arc<dyn SubmoduleStore>,
     ) -> Result<Box<dyn WorkingCopy>, WorkingCopyStateError> {
         Ok(Box::new(LocalWorkingCopy::init(
             store,
@@ -2934,6 +2940,7 @@ impl WorkingCopyFactory for LocalWorkingCopyFactory {
             operation_id,
             workspace_name,
             settings,
+            submodule_store,
         )?))
     }
 
@@ -2943,12 +2950,14 @@ impl WorkingCopyFactory for LocalWorkingCopyFactory {
         working_copy_path: PathBuf,
         state_path: PathBuf,
         settings: &UserSettings,
+        submodule_store: Arc<dyn SubmoduleStore>,
     ) -> Result<Box<dyn WorkingCopy>, WorkingCopyStateError> {
         Ok(Box::new(LocalWorkingCopy::load(
             store,
             working_copy_path,
             state_path,
             settings,
+            submodule_store,
         )?))
     }
 }
@@ -2962,6 +2971,233 @@ pub struct LockedLocalWorkingCopy {
     tree_state_dirty: bool,
     new_workspace_name: Option<WorkspaceNameBuf>,
     _lock: FileLock,
+}
+
+fn add_checkout_stats(stats: &mut CheckoutStats, other: CheckoutStats) {
+    stats.updated_files += other.updated_files;
+    stats.added_files += other.added_files;
+    stats.removed_files += other.removed_files;
+    stats.skipped_files += other.skipped_files;
+    stats.skipped_submodules.extend(other.skipped_submodules);
+}
+
+#[cfg(feature = "git")]
+fn submodule_state_error(
+    message: &str,
+    err: impl Into<Box<dyn Error + Send + Sync>>,
+) -> CheckoutError {
+    CheckoutError::Other {
+        message: message.to_owned(),
+        err: err.into(),
+    }
+}
+
+impl LockedLocalWorkingCopy {
+    /// Where the tree state of the populated submodule at `path` is kept.
+    fn submodule_state_path(&self, path: &RepoPath) -> PathBuf {
+        self.wc
+            .state_path
+            .join("submodules")
+            .join(crate::default_submodule_store::encode_name(
+                path.as_internal_file_string(),
+            ))
+    }
+
+    /// Paths of submodules that currently have populated state.
+    #[cfg(feature = "git")]
+    fn populated_submodule_paths(&self) -> Vec<RepoPathBuf> {
+        let Ok(entries) = fs::read_dir(self.wc.state_path.join("submodules")) else {
+            return vec![];
+        };
+        entries
+            .flatten()
+            .filter_map(|entry| {
+                let name = crate::default_submodule_store::decode_name(
+                    &entry.file_name().to_string_lossy(),
+                );
+                RepoPathBuf::from_internal_string(name).ok()
+            })
+            .sorted()
+            .collect()
+    }
+}
+
+/// A missing, conflicted, or unparsable .gitmodules means "no submodules":
+/// the gitlinks stay empty directories as before.
+#[cfg(feature = "git")]
+async fn gitmodules_by_path(store: &Store, tree: &MergedTree) -> HashMap<RepoPathBuf, String> {
+    match crate::git_submodule::read_gitmodules(store, tree).await {
+        Ok(submodules) => crate::git_submodule::gitmodules_by_path(&submodules),
+        Err(_) => HashMap::new(),
+    }
+}
+
+/// Populating submodule directories: each populated submodule gets its own
+/// [`TreeState`] backed by the submodule repo's store, rooted at the
+/// submodule's directory. The superproject's own tree state never looks
+/// inside submodule directories, so nothing here is ever snapshotted.
+#[cfg(feature = "git")]
+impl LockedLocalWorkingCopy {
+    fn nested_tree_state(
+        &self,
+        store: Arc<Store>,
+        path: &RepoPath,
+    ) -> Result<TreeState, CheckoutError> {
+        let state_path = self.submodule_state_path(path);
+        fs::create_dir_all(&state_path).map_err(|err| {
+            submodule_state_error("Failed to create submodule state directory", err)
+        })?;
+        let settings = TreeStateSettings {
+            fsmonitor_settings: FsmonitorSettings::None,
+            ..self.wc.tree_state_settings.clone()
+        };
+        TreeState::load(
+            store,
+            path.to_fs_path(&self.wc.working_copy_path)?,
+            state_path,
+            &settings,
+        )
+        .map_err(|err| submodule_state_error("Failed to load submodule state", err))
+    }
+
+    /// Clears populated submodules that `new_tree` (restricted to
+    /// `new_matcher`) doesn't have at the same path under the same name.
+    async fn clear_submodules(
+        &mut self,
+        old_tree: &MergedTree,
+        new_tree: &MergedTree,
+        new_matcher: &dyn Matcher,
+        stats: &mut CheckoutStats,
+    ) -> Result<(), CheckoutError> {
+        let populated = self.populated_submodule_paths();
+        if populated.is_empty() {
+            return Ok(());
+        }
+        let store = self.wc.store.clone();
+        let old_map = gitmodules_by_path(&store, old_tree).await;
+        let new_map = gitmodules_by_path(&store, new_tree).await;
+        for path in populated {
+            let new_name = new_map.get(&path);
+            let keep = new_name.is_some()
+                && new_name == old_map.get(&path)
+                && new_matcher.matches(&path)
+                && matches!(
+                    new_tree.path_value(&path).await?.as_normal(),
+                    Some(TreeValue::GitSubmodule(_))
+                );
+            if keep {
+                continue;
+            }
+            match old_map.get(&path).or(new_name) {
+                Some(name) => self.clear_submodule_at(&path, name, stats)?,
+                None => stats.skipped_submodules.push((
+                    path,
+                    "not in .gitmodules; its populated files were left in place".to_owned(),
+                )),
+            }
+        }
+        Ok(())
+    }
+
+    fn clear_submodule_at(
+        &self,
+        path: &RepoPath,
+        name: &str,
+        stats: &mut CheckoutStats,
+    ) -> Result<(), CheckoutError> {
+        let Some(loader) = self
+            .wc
+            .submodule_store
+            .load_repo(name)
+            .map_err(|err| submodule_state_error("Failed to load submodule repo", err))?
+        else {
+            stats.skipped_submodules.push((
+                path.to_owned(),
+                format!(
+                    "submodule {name:?} is no longer cloned; its populated files were left in \
+                     place"
+                ),
+            ));
+            return Ok(());
+        };
+        let store = loader.store().clone();
+        let mut state = self.nested_tree_state(store.clone(), path)?;
+        add_checkout_stats(stats, state.check_out(&store.empty_merged_tree())?);
+        let state_path = self.submodule_state_path(path);
+        fs::remove_dir_all(&state_path)
+            .map_err(|err| submodule_state_error("Failed to remove submodule state directory", err))
+    }
+
+    /// Populates every submodule declared in `tree`'s `.gitmodules` (within
+    /// `matcher`) whose repo and commit are available. Misses are reported in
+    /// `stats.skipped_submodules`, never errors.
+    async fn populate_submodules_in(
+        &mut self,
+        tree: &MergedTree,
+        matcher: &dyn Matcher,
+        stats: &mut CheckoutStats,
+    ) -> Result<(), CheckoutError> {
+        let by_path = gitmodules_by_path(&self.wc.store.clone(), tree).await;
+        for (path, name) in by_path.into_iter().sorted() {
+            if !matcher.matches(&path) {
+                continue;
+            }
+            let Some(TreeValue::GitSubmodule(commit_id)) =
+                tree.path_value(&path).await?.as_normal().cloned()
+            else {
+                continue;
+            };
+            match self.populate_submodule_at(&path, &name, &commit_id)? {
+                Ok(sub_stats) => add_checkout_stats(stats, sub_stats),
+                Err(reason) => stats.skipped_submodules.push((path, reason)),
+            }
+        }
+        Ok(())
+    }
+
+    /// `Ok(Err(reason))` when the submodule can't be populated right now.
+    fn populate_submodule_at(
+        &self,
+        path: &RepoPath,
+        name: &str,
+        commit_id: &CommitId,
+    ) -> Result<Result<CheckoutStats, String>, CheckoutError> {
+        let Some(loader) = self
+            .wc
+            .submodule_store
+            .load_repo(name)
+            .map_err(|err| submodule_state_error("Failed to load submodule repo", err))?
+        else {
+            return Ok(Err(format!(
+                "submodule {name:?} is not cloned; run `jj git submodule clone {name}`"
+            )));
+        };
+        let store = loader.store().clone();
+        let commit = match store.get_commit(commit_id) {
+            Ok(commit) => commit,
+            Err(BackendError::ObjectNotFound { .. }) => {
+                return Ok(Err(format!(
+                    "commit {} is not in submodule {name:?}; run `jj git submodule fetch {name}`",
+                    commit_id.hex()
+                )));
+            }
+            Err(err) => return Err(err.into()),
+        };
+        let disk_path = path.to_fs_path(&self.wc.working_copy_path)?;
+        if let Err(err) = fs::create_dir_all(&disk_path) {
+            return Ok(Err(format!("its directory could not be created: {err}")));
+        }
+        let mut state = self.nested_tree_state(store, path)?;
+        let new_tree = commit.tree();
+        if state.current_tree().tree_ids_and_labels() == new_tree.tree_ids_and_labels() {
+            return Ok(Ok(CheckoutStats::default()));
+        }
+        let sub_stats = state.check_out(&new_tree)?;
+        state
+            .save()
+            .map_err(|err| submodule_state_error("Failed to save submodule state", err))?;
+        Ok(Ok(sub_stats))
+    }
 }
 
 #[async_trait]
@@ -2988,14 +3224,49 @@ impl LockedWorkingCopy for LockedLocalWorkingCopy {
         // TODO: Write a "pending_checkout" file with the new TreeId so we can
         // continue an interrupted update if we find such a file.
         let new_tree = commit.tree();
-        let tree_state = self.wc.tree_state_mut()?;
-        if tree_state.tree.tree_ids_and_labels() != new_tree.tree_ids_and_labels() {
-            let stats = tree_state.check_out(&new_tree)?;
-            self.tree_state_dirty = true;
-            Ok(stats)
-        } else {
-            Ok(CheckoutStats::default())
+        let old_tree = self.wc.tree_state()?.current_tree().clone();
+        if old_tree.tree_ids_and_labels() == new_tree.tree_ids_and_labels() {
+            return Ok(CheckoutStats::default());
         }
+        let matcher = self.wc.tree_state()?.sparse_matcher();
+        let mut stats = CheckoutStats::default();
+        // Submodule contents must be removed before the superproject update
+        // deletes their (then empty) directories; otherwise the files would be
+        // snapshotted as new files of the superproject.
+        #[cfg(feature = "git")]
+        self.clear_submodules(&old_tree, &new_tree, matcher.as_ref(), &mut stats)
+            .await?;
+        add_checkout_stats(&mut stats, self.wc.tree_state_mut()?.check_out(&new_tree)?);
+        self.tree_state_dirty = true;
+        #[cfg(feature = "git")]
+        self.populate_submodules_in(&new_tree, matcher.as_ref(), &mut stats)
+            .await?;
+        Ok(stats)
+    }
+
+    async fn populate_submodules(&mut self) -> Result<CheckoutStats, CheckoutError> {
+        let mut stats = CheckoutStats::default();
+        #[cfg(feature = "git")]
+        {
+            let tree = self.wc.tree_state()?.current_tree().clone();
+            let matcher = self.wc.tree_state()?.sparse_matcher();
+            self.populate_submodules_in(&tree, matcher.as_ref(), &mut stats)
+                .await?;
+        }
+        Ok(stats)
+    }
+
+    async fn clear_submodule(&mut self, path: &RepoPath) -> Result<CheckoutStats, CheckoutError> {
+        let mut stats = CheckoutStats::default();
+        #[cfg(feature = "git")]
+        if self.submodule_state_path(path).exists() {
+            let tree = self.wc.tree_state()?.current_tree().clone();
+            let store = self.wc.store.clone();
+            if let Some(name) = gitmodules_by_path(&store, &tree).await.get(path) {
+                self.clear_submodule_at(path, name, &mut stats)?;
+            }
+        }
+        Ok(stats)
     }
 
     fn rename_workspace(&mut self, new_name: WorkspaceNameBuf) {
@@ -3026,11 +3297,22 @@ impl LockedWorkingCopy for LockedLocalWorkingCopy {
     ) -> Result<CheckoutStats, CheckoutError> {
         // TODO: Write a "pending_checkout" file with new sparse patterns so we can
         // continue an interrupted update if we find such a file.
-        let stats = self
-            .wc
-            .tree_state_mut()?
-            .set_sparse_patterns(new_sparse_patterns)?;
+        let tree = self.wc.tree_state()?.current_tree().clone();
+        let new_matcher = PrefixMatcher::new(&new_sparse_patterns);
+        let mut stats = CheckoutStats::default();
+        #[cfg(feature = "git")]
+        self.clear_submodules(&tree, &tree, &new_matcher, &mut stats)
+            .await?;
+        add_checkout_stats(
+            &mut stats,
+            self.wc
+                .tree_state_mut()?
+                .set_sparse_patterns(new_sparse_patterns)?,
+        );
         self.tree_state_dirty = true;
+        #[cfg(feature = "git")]
+        self.populate_submodules_in(&tree, &new_matcher, &mut stats)
+            .await?;
         Ok(stats)
     }
 

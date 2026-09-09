@@ -181,6 +181,15 @@ and this project adheres to
 * The hunk headers of `diff.color-words.conflict = "pair"` now include the
   conflict labels of the compared terms.
 
+* Experimental read-only Git submodule support. `jj git submodule clone --all`
+  clones the submodules declared in `.gitmodules` into the jj repo, after which
+  checking out a commit populates their directories with the gitlinked
+  commit's files. `jj git submodule fetch|list|delete|populate` manage the
+  submodule store. Submodules that aren't cloned (or whose commit isn't
+  fetched) are left as empty directories with a warning. Changes inside a
+  submodule directory are still not snapshotted.
+  [#494](https://github.com/jj-vcs/jj/issues/494)
+
 ### Fixed bugs
 
 * On Windows, `jj` no longer hangs when a subprocess needs to prompt the user,

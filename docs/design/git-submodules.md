@@ -137,16 +137,45 @@ I.e. outcomes we would like to see if there were no constraints whatsoever.
 
 ### Guiding principles
 
-TODO
+- Submodules are not standalone repositories: every interaction goes through
+  the superproject, and `jj` is never run inside a submodule directory.
+- Commands involve submodules by default: checking out a superproject commit
+  populates the submodule directories that can be populated.
+- The submodule store is the source of truth and the working copy is a hint:
+  a submodule whose repo or commit is missing is an empty directory plus a
+  warning, never an error.
 
 ### Storing submodules
 
-Possible approaches under discussion. See
-[./git-submodule-storage.md](./git-submodule-storage.md).
+Decided per [./git-submodule-storage.md](./git-submodule-storage.md) and
+implemented in Phase 1:
+
+- Each submodule is a full jj repo (internal Git backend, own operation log,
+  no workspace) at `.jj/repo/submodule_store/<name>`, where `<name>` is the
+  `.gitmodules` name percent-encoded so it can never escape the store.
+- `.gitmodules` in the tree is authoritative for name ↔ path ↔ url and is
+  parsed with gix. Gitlinks without a `.gitmodules` entry stay empty
+  directories.
+- The submodule's remote is always `origin`; fetches import all branches and
+  tags and never abandon unreachable commits, since the superproject may point
+  at commits on no branch.
+- The superproject's working copy owns submodule files. Each populated
+  submodule has its own tree state under
+  `.jj/working_copy/submodules/<encoded path>`, backed by the submodule
+  repo's store and rooted at the submodule directory. On checkout, submodules
+  that go away are cleared *before* the superproject update (so their files
+  are never snapshotted as new superproject files), and the ones in the new
+  tree are populated after it. The superproject tree state never descends
+  into submodule directories.
+- Manual management: `jj git submodule clone|fetch|list|delete|populate`
+  (hidden while experimental). Automatic cloning on `jj git clone` and
+  fetching on `jj git fetch` are not implemented yet.
 
 ### Snapshotting new submodule changes
 
-TODO
+TODO. The per-submodule tree state described above is the intended hook:
+snapshotting a submodule directory would snapshot into the submodule repo and
+update the superproject gitlink.
 
 ### Merging/rebasing with submodules
 
