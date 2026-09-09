@@ -214,6 +214,67 @@ fn test_git_submodule_clone_fetch_delete() {
     ");
     assert_eq!(std::fs::read_to_string(&sub_file).unwrap(), "sub\n");
 
+    // Local changes inside a submodule are never clobbered: the directory is
+    // kept (with a warning) when leaving, when the gitlink would move, and
+    // its files never leak into the superproject's snapshot.
+    std::fs::write(&sub_file, "local edit\n").unwrap();
+    work_dir.write_file("sub/untracked", "untracked\n");
+    let output = work_dir.run_jj(["new", "root()"]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Working copy  (@) now at: 
+    Parent commit (@-)      : 
+    Added 0 files, modified 0 files, removed 1 files
+    Warning: Submodule at sub: it has local changes, which jj cannot snapshot yet; the directory was left as is
+    [EOF]
+    ");
+    assert_eq!(std::fs::read_to_string(&sub_file).unwrap(), "local edit\n");
+    let output = work_dir.run_jj(["status"]);
+    insta::assert_snapshot!(output, @"
+    Working copy changes:
+    A sub
+    Working copy  (@) : 
+    Parent commit (@-): 
+    [EOF]
+    ");
+    let output = work_dir.run_jj(["new", "master"]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Working copy  (@) now at: 
+    Parent commit (@-)      : Add submodule
+    Added 1 files, modified 0 files, removed 0 files
+    Warning: Submodule at sub: it has local changes, which jj cannot snapshot yet; the directory was left as is
+    [EOF]
+    ");
+    assert_eq!(std::fs::read_to_string(&sub_file).unwrap(), "local edit\n");
+    let output = work_dir.run_jj(["status"]);
+    insta::assert_snapshot!(output, @"
+    The working copy has no changes.
+    Working copy  (@) : 
+    Parent commit (@-): Add submodule
+    [EOF]
+    ");
+    // Undo the local changes; the submodule is managed again.
+    std::fs::write(&sub_file, "sub\n").unwrap();
+    std::fs::remove_file(work_dir.root().join("sub/untracked")).unwrap();
+    let output = work_dir.run_jj(["new", "root()"]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Working copy  (@) now at: 
+    Parent commit (@-)      : 
+    Added 0 files, modified 0 files, removed 3 files
+    [EOF]
+    ");
+    assert!(!work_dir.root().join("sub").exists());
+    let output = work_dir.run_jj(["new", "master"]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Working copy  (@) now at: 
+    Parent commit (@-)      : Add submodule
+    Added 3 files, modified 0 files, removed 0 files
+    [EOF]
+    ");
+
     // A new commit in the submodule's remote is picked up by fetch.
     let submodule_dir = test_env.work_dir("submodule");
     submodule_dir.write_file("sub2", "sub2\n");

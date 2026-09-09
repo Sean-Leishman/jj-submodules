@@ -42,6 +42,22 @@ Dead ends / gotchas:
 - Populate must `create_dir_all` the submodule dir itself; `create_parent_dirs`
   only makes parents of entries.
 
+Smoke test on real repos (jq, bat with 93 submodules), same day:
+- Found and fixed: local edits inside a populated submodule were clobbered on
+  `jj new`, and untracked files left in a cleared submodule dir leaked into the
+  next superproject snapshot. Fix: pre-pass snapshots each affected nested
+  state (throwaway, compares tree ids, not the "state changed" flag which fires
+  on mtime bumps); dirty submodules are kept and their *old gitlink stays in the
+  checked-out tree*, so the wc commit shows `A sub`/modified gitlink. Excluding
+  the path from the superproject update instead violated the debug invariant
+  `file_states paths == tree paths`.
+- 93 uncloned submodules printed 93 warnings on clone; capped at 5 + summary.
+- bat: clone --all 1m42s; `jj new` populating 7860 files across 92 nested
+  states ~5s, clearing ~1s. Gitlink pointing at a commit on no branch warns
+  correctly (Git would fetch by sha; we don't).
+- jq history walk incl. gitlink bump and vendor→modules path move worked; the
+  moved submodule has a new name so it needs its own clone, same as Git.
+
 Not done (next slice): auto-clone on `jj git clone`, auto-fetch on `jj git
 fetch`, `jj git submodule sync`, `jj status` integration, Phase 2 snapshotting
 (hook = nested `TreeState::snapshot`), gitlink conflict handling (#7806, #7386

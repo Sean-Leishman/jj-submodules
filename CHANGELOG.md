@@ -187,7 +187,8 @@ and this project adheres to
   commit's files. `jj git submodule fetch|list|delete|populate` manage the
   submodule store. Submodules that aren't cloned (or whose commit isn't
   fetched) are left as empty directories with a warning. Changes inside a
-  submodule directory are still not snapshotted.
+  submodule directory are still not snapshotted, but a submodule with local
+  changes is never overwritten or removed by a checkout.
   [#494](https://github.com/jj-vcs/jj/issues/494)
 
 ### Fixed bugs

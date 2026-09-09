@@ -167,6 +167,13 @@ implemented in Phase 1:
   are never snapshotted as new superproject files), and the ones in the new
   tree are populated after it. The superproject tree state never descends
   into submodule directories.
+- A populated submodule with local changes (detected by a throwaway snapshot
+  against the submodule's own store, honoring its `.gitignore`s) is never
+  clobbered. Its directory is left alone with a warning, and the gitlink it
+  currently corresponds to is kept in the tree that gets checked out, so the
+  working-copy commit shows the submodule as modified relative to its parent,
+  the way `git status` reports a dirty submodule. Once the changes are undone
+  the submodule is managed again.
 - Manual management: `jj git submodule clone|fetch|list|delete|populate`
   (hidden while experimental). Automatic cloning on `jj git clone` and
   fetching on `jj git fetch` are not implemented yet.

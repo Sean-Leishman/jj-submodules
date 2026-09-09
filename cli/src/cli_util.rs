@@ -3391,11 +3391,20 @@ Discard the conflicting changes with `jj restore --from {}`.",
             short_commit_hash(new_commit.id())
         )?;
     }
-    for (path, reason) in &stats.skipped_submodules {
+    const MAX_SUBMODULE_WARNINGS: usize = 5;
+    for (path, reason) in stats.skipped_submodules.iter().take(MAX_SUBMODULE_WARNINGS) {
         writeln!(
             ui.warning_default(),
             "Submodule at {path}: {reason}",
             path = path.as_internal_file_string()
+        )?;
+    }
+    if stats.skipped_submodules.len() > MAX_SUBMODULE_WARNINGS {
+        writeln!(
+            ui.warning_default(),
+            "... and {} more submodules were not populated (run `jj git submodule populate` to \
+             see them all).",
+            stats.skipped_submodules.len() - MAX_SUBMODULE_WARNINGS
         )?;
     }
     Ok(())
