@@ -43,6 +43,7 @@ use crate::command_error::cli_error;
 use crate::command_error::user_error;
 use crate::command_error::user_error_with_message;
 use crate::commands::git::maybe_add_gitignore;
+use crate::commands::git::submodule::clone_declared_submodules;
 use crate::config::ConfigEnv;
 use crate::git_util::GitSubprocessUi;
 use crate::git_util::absolute_git_url;
@@ -306,6 +307,11 @@ pub async fn cmd_git_clone(
             .view()
             .get_remote_bookmark(working_symbol);
         if let Some(commit_id) = working_branch_remote_ref.target.as_normal().cloned() {
+            if command.settings().get_bool("git.clone-submodules")?
+                && let Ok(commit) = workspace_command.repo().store().get_commit(&commit_id)
+            {
+                clone_declared_submodules(ui, &workspace_command, &commit).await?;
+            }
             let mut tx = workspace_command.start_transaction();
             if let Ok(commit) = tx.repo().store().get_commit_async(&commit_id).await {
                 tx.check_out(&commit)?;

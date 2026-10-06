@@ -12,12 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashMap;
 use std::io::Write as _;
 
 use clap::Subcommand;
+use jj_lib::backend::CommitId;
+use jj_lib::commit::Commit;
 use jj_lib::git::get_git_backend;
 use jj_lib::git_submodule;
 use jj_lib::git_submodule::GitSubmoduleError;
+use jj_lib::git_submodule::SubmoduleConfig;
 use jj_lib::repo::Repo as _;
 
 use crate::cli_util::CommandHelper;
@@ -121,59 +125,81 @@ async fn cmd_submodule_clone(
     args: &SubmoduleCloneArgs,
 ) -> Result<(), CommandError> {
     let mut workspace_command = command.workspace_helper(ui).await?;
-    let repo = workspace_command.repo().clone();
     let commit = workspace_command
         .resolve_single_rev(ui, &args.revision)
         .await?;
-    let submodules = git_submodule::read_gitmodules(repo.store(), &commit.tree()).await?;
-    let store = repo.submodule_store();
-    let names: Vec<&str> = if args.all {
-        let cloned = store.list()?;
-        submodules
-            .keys()
-            .map(String::as_str)
-            .filter(|name| !cloned.iter().any(|c| c == name))
-            .collect()
+    if args.all {
+        clone_declared_submodules(ui, &workspace_command, &commit).await?;
     } else {
-        args.names.iter().map(String::as_str).collect()
-    };
-    let object_hash = get_git_backend(repo.store())?.git_repo().object_hash();
-    for name in names {
-        let Some(config) = submodules.get(name) else {
-            return Err(user_error(format!(
-                "Submodule {name:?} is not declared in .gitmodules"
-            )));
-        };
-        writeln!(
-            ui.status(),
-            "Cloning submodule {name:?} from {}",
-            config.url
-        )?;
-        let result = git_submodule::clone_submodule(
-            store.as_ref(),
-            workspace_command.settings(),
-            name,
-            &config.url,
-            object_hash,
-            &mut GitSubprocessUi::new(ui),
-        )
-        .await;
-        match result {
-            Ok(stats) => print_git_import_stats_summary(ui, &stats)?,
-            // Best effort when cloning many; a single explicit name still fails.
-            Err(err) if args.all => {
-                writeln!(
-                    ui.warning_default(),
-                    "Failed to clone submodule {name:?}: {err}"
-                )?;
-            }
-            Err(err) => return Err(err.into()),
+        let repo = workspace_command.repo().clone();
+        let submodules = git_submodule::read_gitmodules(repo.store(), &commit.tree()).await?;
+        let gitlinks = git_submodule::submodule_gitlinks(&commit.tree(), &submodules).await?;
+        for name in &args.names {
+            let Some(config) = submodules.get(name) else {
+                return Err(user_error(format!(
+                    "Submodule {name:?} is not declared in .gitmodules"
+                )));
+            };
+            clone_one(ui, &workspace_command, config, gitlinks.get(name)).await?;
         }
     }
     populate_submodules(ui, &mut workspace_command).await
 }
 
-async fn populate_submodules(
+/// Clones every submodule declared in `commit`'s `.gitmodules` that isn't in
+/// the store yet. Best effort: a failed clone is a warning, not an error.
+pub(crate) async fn clone_declared_submodules(
+    ui: &mut Ui,
+    workspace_command: &WorkspaceCommandHelper,
+    commit: &Commit,
+) -> Result<(), CommandError> {
+    let repo = workspace_command.repo().clone();
+    let submodules = git_submodule::read_gitmodules(repo.store(), &commit.tree()).await?;
+    let gitlinks = git_submodule::submodule_gitlinks(&commit.tree(), &submodules).await?;
+    let cloned = repo.submodule_store().list()?;
+    for (name, config) in &submodules {
+        if cloned.contains(name) {
+            continue;
+        }
+        if let Err(err) = clone_one(ui, workspace_command, config, gitlinks.get(name)).await {
+            writeln!(
+                ui.warning_default(),
+                "Failed to clone submodule {name:?}: {}",
+                err.error
+            )?;
+        }
+    }
+    Ok(())
+}
+
+async fn clone_one(
+    ui: &mut Ui,
+    workspace_command: &WorkspaceCommandHelper,
+    config: &SubmoduleConfig,
+    gitlink: Option<&CommitId>,
+) -> Result<(), CommandError> {
+    let repo = workspace_command.repo();
+    let object_hash = get_git_backend(repo.store())?.git_repo().object_hash();
+    writeln!(
+        ui.status(),
+        "Cloning submodule {:?} from {}",
+        config.name,
+        config.url
+    )?;
+    let stats = git_submodule::clone_submodule(
+        repo.submodule_store().as_ref(),
+        workspace_command.settings(),
+        &config.name,
+        &config.url,
+        object_hash,
+        gitlink.map(std::slice::from_ref).unwrap_or_default(),
+        &mut GitSubprocessUi::new(ui),
+    )
+    .await?;
+    print_git_import_stats_summary(ui, &stats)
+}
+
+pub(crate) async fn populate_submodules(
     ui: &mut Ui,
     workspace_command: &mut WorkspaceCommandHelper,
 ) -> Result<(), CommandError> {
@@ -237,28 +263,63 @@ async fn cmd_submodule_fetch(
     command: &CommandHelper,
     args: &SubmoduleFetchArgs,
 ) -> Result<(), CommandError> {
-    let workspace_command = command.workspace_helper(ui).await?;
-    let store = workspace_command.repo().submodule_store();
+    let mut workspace_command = command.workspace_helper(ui).await?;
+    let store = workspace_command.repo().submodule_store().clone();
+    for name in &args.names {
+        if store.load_repo(name)?.is_none() {
+            return Err(GitSubmoduleError::NotCloned(name.clone()).into());
+        }
+    }
     let names = if args.names.is_empty() {
         store.list()?
     } else {
         args.names.clone()
     };
-    for name in &names {
+    fetch_stored_submodules(ui, &mut workspace_command, &names, &[]).await
+}
+
+/// Fetches the given stored submodules, asking by hash for the gitlinks of the
+/// working-copy commit and `also_scan` if branches and tags didn't bring them,
+/// then populates.
+pub(crate) async fn fetch_stored_submodules(
+    ui: &mut Ui,
+    workspace_command: &mut WorkspaceCommandHelper,
+    names: &[String],
+    also_scan: &[CommitId],
+) -> Result<(), CommandError> {
+    if names.is_empty() {
+        return Ok(());
+    }
+    let repo = workspace_command.repo().clone();
+    let store = repo.submodule_store();
+    let mut gitlinks: HashMap<String, Vec<CommitId>> = HashMap::new();
+    for id in workspace_command.get_wc_commit_id().into_iter().chain(also_scan) {
+        let tree = repo.store().get_commit(id)?.tree();
+        let submodules = git_submodule::read_gitmodules(repo.store(), &tree).await?;
+        for (name, gitlink) in git_submodule::submodule_gitlinks(&tree, &submodules).await? {
+            let ids = gitlinks.entry(name).or_default();
+            if !ids.contains(&gitlink) {
+                ids.push(gitlink);
+            }
+        }
+    }
+    for name in names {
         let Some(loader) = store.load_repo(name)? else {
-            return Err(GitSubmoduleError::NotCloned(name.clone()).into());
+            writeln!(ui.warning_default(), "Submodule {name:?} is not cloned")?;
+            continue;
         };
-        let repo = loader.load_at_head().await?;
+        let sub_repo = loader.load_at_head().await?;
         writeln!(ui.status(), "Fetching submodule {name:?}")?;
         let stats = git_submodule::fetch_submodule(
-            &repo,
+            &sub_repo,
             workspace_command.settings(),
+            gitlinks.get(name).map(Vec::as_slice).unwrap_or_default(),
             &mut GitSubprocessUi::new(ui),
         )
         .await?;
         print_git_import_stats_summary(ui, &stats)?;
     }
-    Ok(())
+    populate_submodules(ui, workspace_command).await
 }
 
 async fn cmd_submodule_list(

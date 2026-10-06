@@ -342,3 +342,138 @@ fn test_git_submodule_clone_fetch_delete() {
     [EOF]
     "#);
 }
+
+#[test]
+fn test_git_submodule_auto_clone_and_fetch() {
+    let test_env = TestEnvironment::default();
+    let work_dir = set_up_superproject(&test_env);
+    let submodule_dir = test_env.work_dir("submodule");
+    // Let the file:// remote serve commits that are on no branch.
+    submodule_dir
+        .run_jj([
+            "util",
+            "exec",
+            "--",
+            "git",
+            "config",
+            "uploadpack.allowAnySHA1InWant",
+            "true",
+        ])
+        .success();
+
+    // `jj git clone` clones and populates the submodules by itself.
+    let output = test_env.run_jj_in(
+        ".",
+        [
+            "git",
+            "clone",
+            &format!("{}/repo", test_env.env_root().display()),
+            "clone",
+        ],
+    );
+    insta::assert_snapshot!(output, @r#"
+    ------- stderr -------
+    Fetching into new repo in "$TEST_ENV/clone"
+    bookmark: master@origin [new] tracked
+    Setting the revset alias `trunk()` to `master@origin`.
+    Cloning submodule "sub" from $TEST_ENV/submodule
+    Working copy  (@) now at: 
+    Parent commit (@-)      : Add submodule
+    Added 3 files, modified 0 files, removed 0 files
+    [EOF]
+    "#);
+    let clone_dir = test_env.work_dir("clone");
+    assert_eq!(
+        std::fs::read_to_string(clone_dir.root().join("sub/sub")).unwrap(),
+        "sub\n"
+    );
+    let output = clone_dir.run_jj(["git", "submodule", "list"]);
+    insta::assert_snapshot!(output, @"
+    sub: sub
+    [EOF]
+    ");
+
+    // Point the superproject at a submodule commit that is on no branch.
+    submodule_dir.write_file("detached", "detached\n");
+    submodule_dir
+        .run_jj(["commit", "-m", "Detached commit"])
+        .success();
+    let detached_id = submodule_dir
+        .run_jj(["log", "-r", "@-", "--no-graph", "-T", "commit_id"])
+        .success()
+        .stdout
+        .into_raw();
+    work_dir
+        .run_jj_with(|cmd| {
+            cmd.env("GIT_AUTHOR_DATE", "2001-02-03T04:05:06+07:00")
+                .env("GIT_COMMITTER_DATE", "2001-02-03T04:05:06+07:00")
+                .args([
+                    "util",
+                    "exec",
+                    "--",
+                    "sh",
+                    "-c",
+                    &format!(
+                        "git update-index --add --cacheinfo 160000,{detached_id},sub && git -c \
+                         user.email=test@example.com -c user.name='Test user' commit -m 'Bump \
+                         submodule'"
+                    ),
+                ])
+        })
+        .success();
+
+    // `jj git fetch` fetches the superproject, then the submodule, including
+    // the new gitlink commit by hash, and populates it.
+    let output = clone_dir.run_jj(["git", "fetch"]);
+    insta::assert_snapshot!(output, @r#"
+    ------- stderr -------
+    Fetching from Git remotes: origin
+    bookmark: master@origin [updated] tracked
+    Fetching submodule "sub"
+    [EOF]
+    "#);
+    let output = clone_dir.run_jj(["new", "master@origin"]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Working copy  (@) now at: 
+    Parent commit (@-)      : Bump submodule
+    Added 1 files, modified 1 files, removed 0 files
+    [EOF]
+    ");
+    assert_eq!(
+        std::fs::read_to_string(clone_dir.root().join("sub/detached")).unwrap(),
+        "detached\n"
+    );
+
+    // Both can be turned off.
+    let output = test_env.run_jj_in(
+        ".",
+        [
+            "git",
+            "clone",
+            "--config=git.clone-submodules=false",
+            &format!("{}/repo", test_env.env_root().display()),
+            "clone2",
+        ],
+    );
+    insta::assert_snapshot!(output, @r#"
+    ------- stderr -------
+    Fetching into new repo in "$TEST_ENV/clone2"
+    bookmark: master@origin [new] tracked
+    Setting the revset alias `trunk()` to `master@origin`.
+    Working copy  (@) now at: 
+    Parent commit (@-)      : Bump submodule
+    Added 2 files, modified 0 files, removed 0 files
+    Warning: Submodule at sub: submodule "sub" is not cloned; run `jj git submodule clone sub`
+    [EOF]
+    "#);
+    let clone2_dir = test_env.work_dir("clone2");
+    assert!(!clone2_dir.root().join("sub/sub").exists());
+    let output = clone2_dir.run_jj(["git", "fetch", "--config=git.fetch-submodules=false"]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Fetching from Git remotes: origin
+    Nothing changed.
+    [EOF]
+    ");
+}

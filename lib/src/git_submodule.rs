@@ -26,6 +26,7 @@ use futures::AsyncReadExt as _;
 use thiserror::Error;
 
 use crate::backend::BackendError;
+use crate::backend::CommitId;
 use crate::backend::TreeValue;
 use crate::config::ConfigGetError;
 use crate::file_util::IoResultExt as _;
@@ -40,13 +41,18 @@ use crate::git::GitRefExpansionError;
 use crate::git::GitRemoteManagementError;
 use crate::git::GitSettings;
 use crate::git::GitSubprocessCallback;
+use crate::git::RefSpec;
 use crate::git::UnexpectedGitBackendError;
 use crate::git::add_remote;
+use crate::git::get_git_backend;
 use crate::git_backend::GitBackend;
+use crate::git_subprocess::GitSubprocessContext;
 use crate::merged_tree::MergedTree;
+use crate::object_id::ObjectId as _;
 use crate::ref_name::RemoteName;
 use crate::repo::BackendInitializer;
 use crate::repo::ReadonlyRepo;
+use crate::repo::Repo as _;
 use crate::repo::RepoInitError;
 use crate::repo::RepoLoaderError;
 use crate::repo_path::RepoPath;
@@ -159,6 +165,22 @@ fn parse_gitmodules(bytes: &[u8]) -> Result<BTreeMap<String, SubmoduleConfig>, G
     Ok(submodules)
 }
 
+/// The commit each declared submodule is checked out at in `tree`, by name.
+/// Submodules whose path holds no gitlink are absent.
+pub async fn submodule_gitlinks(
+    tree: &MergedTree,
+    submodules: &BTreeMap<String, SubmoduleConfig>,
+) -> Result<HashMap<String, CommitId>, GitSubmoduleError> {
+    let mut gitlinks = HashMap::new();
+    for config in submodules.values() {
+        if let Some(TreeValue::GitSubmodule(id)) = tree.path_value(&config.path).await?.as_normal()
+        {
+            gitlinks.insert(config.name.clone(), id.clone());
+        }
+    }
+    Ok(gitlinks)
+}
+
 /// Inverts [`read_gitmodules`]: gitlink path → submodule name.
 pub fn gitmodules_by_path(
     submodules: &BTreeMap<String, SubmoduleConfig>,
@@ -177,6 +199,7 @@ pub async fn clone_submodule(
     name: &str,
     url: &str,
     object_hash: gix::hash::Kind,
+    wanted: &[CommitId],
     callback: &mut dyn GitSubprocessCallback,
 ) -> Result<GitImportStats, GitSubmoduleError> {
     let repo_path = store.repo_path(name);
@@ -213,7 +236,7 @@ pub async fn clone_submodule(
             .expect("just initialized")
             .load_at_head()
             .await?;
-        fetch_submodule(&repo, settings, callback).await
+        fetch_submodule(&repo, settings, wanted, callback).await
     }
     .await;
     if result.is_err() {
@@ -222,13 +245,17 @@ pub async fn clone_submodule(
     result
 }
 
-/// Fetches all branches and tags of a submodule repo from its remote.
+/// Fetches all branches and tags of a submodule repo from its remote, then
+/// any of the `wanted` commits (typically the superproject's gitlinks) that
+/// are still missing, by hash. A remote may refuse the latter; that is not an
+/// error, the commit just stays missing.
 ///
 /// Unreachable commits are never abandoned: the superproject may reference
 /// submodule commits that are on no branch.
 pub async fn fetch_submodule(
     repo: &Arc<ReadonlyRepo>,
     settings: &UserSettings,
+    wanted: &[CommitId],
     callback: &mut dyn GitSubprocessCallback,
 ) -> Result<GitImportStats, GitSubmoduleError> {
     let git_settings = GitSettings::from_settings(settings)?;
@@ -256,6 +283,36 @@ pub async fn fetch_submodule(
         git_fetch.import_refs().await?
     };
     tx.commit("fetch from git remote origin").await?;
+
+    let store = repo.store();
+    let missing: Vec<&CommitId> = wanted
+        .iter()
+        .filter(|id| {
+            matches!(
+                store.get_commit(id),
+                Err(BackendError::ObjectNotFound { .. })
+            )
+        })
+        .collect();
+    if !missing.is_empty() {
+        let git_backend = get_git_backend(store)?;
+        let git_ctx = GitSubprocessContext::from_git_backend(
+            git_backend,
+            git_settings.to_subprocess_options(),
+        );
+        // Keep the fetched commits alive with a ref import_refs() ignores.
+        let refspecs: Vec<RefSpec> = missing
+            .iter()
+            .map(|id| RefSpec::forced(id.hex(), format!("refs/jj/gitlink/{}", id.hex())))
+            .collect();
+        for refspec in refspecs {
+            // One at a time: git aborts the whole fetch on one refused hash.
+            if let Err(err) = git_ctx.spawn_fetch(SUBMODULE_REMOTE, &[refspec], &[], callback, None)
+            {
+                tracing::info!(?err, "failed to fetch submodule commit by hash");
+            }
+        }
+    }
     Ok(stats)
 }
 

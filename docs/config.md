@@ -2012,6 +2012,22 @@ This behavior can be disabled by
 track-default-bookmark-on-clone = false
 ```
 
+### Git submodules (experimental)
+
+`jj git clone` clones the Git submodules declared in the checked-out commit's
+`.gitmodules` and populates their directories, and `jj git fetch` also fetches
+already-cloned submodules. Both are best effort and can be turned off:
+
+```toml
+[git]
+clone-submodules = false
+fetch-submodules = false
+```
+
+Submodules can then be managed manually with `jj git submodule`. Changes made
+inside a submodule directory are not snapshotted yet; a submodule with local
+changes is left alone by checkouts.
+
 ### Abandon commits that became unreachable in Git
 
 By default, when `jj` imports refs from Git, it will look for commits that used

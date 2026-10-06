@@ -36,6 +36,7 @@ use crate::cli_util::WorkspaceCommandTransaction;
 use crate::command_error::CommandError;
 use crate::command_error::user_error;
 use crate::commands::git::get_single_remote;
+use crate::commands::git::submodule::fetch_stored_submodules;
 use crate::complete;
 use crate::git_util::GitSubprocessUi;
 use crate::git_util::load_git_import_options;
@@ -251,6 +252,18 @@ pub async fn cmd_git_fetch(
     // TODO: warn_if_tags_not_found()
     tx.finish(ui, format!("fetch from git remote(s) {remote_names}"))
         .await?;
+    if workspace_command
+        .settings()
+        .get_bool("git.fetch-submodules")?
+    {
+        let names = workspace_command.repo().submodule_store().list()?;
+        let updated: Vec<_> = import_stats
+            .changed_remote_bookmarks
+            .iter()
+            .filter_map(|update| update.new_target.as_normal().cloned())
+            .collect();
+        fetch_stored_submodules(ui, &mut workspace_command, &names, &updated).await?;
+    }
     Ok(())
 }
 

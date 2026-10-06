@@ -62,3 +62,21 @@ Not done (next slice): auto-clone on `jj git clone`, auto-fetch on `jj git
 fetch`, `jj git submodule sync`, `jj status` integration, Phase 2 snapshotting
 (hook = nested `TreeState::snapshot`), gitlink conflict handling (#7806, #7386
 panic in builtin merge tool still open).
+
+### 2026-10-06 — submodules: auto-clone on clone, auto-fetch on fetch, gitlinks by hash
+
+- `jj git clone` clones + populates submodules of the checked-out commit;
+  `jj git fetch` fetches stored submodules then populates. Both best effort,
+  gated by `git.clone-submodules` / `git.fetch-submodules` (default true).
+- `fetch_submodule` takes `wanted` commit ids: after branches/tags, any still
+  missing are fetched by hash, one refspec at a time (git aborts the whole
+  fetch on one refused sha), into `refs/jj/gitlink/<hex>` so import_refs
+  ignores them but they stay alive. Refusal is logged, not an error.
+- Gotcha: wanting only `@`'s gitlinks is wrong for `jj git fetch` — the new
+  gitlink is in the just-fetched remote bookmark, not `@`. Fetch now also
+  scans `changed_remote_bookmarks` new targets.
+- Tests need `uploadpack.allowAnySHA1InWant=true` on the file:// submodule
+  remote to serve a no-branch commit.
+
+Still not done: `jj git submodule sync`, `jj status` integration, Phase 2
+snapshotting, gitlink conflict handling.

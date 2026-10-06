@@ -250,7 +250,7 @@ pub(crate) struct RefSpec {
 }
 
 impl RefSpec {
-    fn forced(source: impl Into<String>, destination: impl Into<String>) -> Self {
+    pub(crate) fn forced(source: impl Into<String>, destination: impl Into<String>) -> Self {
         Self {
             forced: true,
             source: Some(source.into()),

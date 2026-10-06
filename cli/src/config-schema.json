@@ -550,6 +550,16 @@
                     "description": "Whether `jj git clone` creates a local bookmark tracking the default remote bookmark",
                     "default": true
                 },
+                "clone-submodules": {
+                    "type": "boolean",
+                    "description": "Whether `jj git clone` also clones the Git submodules of the checked-out commit (experimental)",
+                    "default": true
+                },
+                "fetch-submodules": {
+                    "type": "boolean",
+                    "description": "Whether `jj git fetch` also fetches cloned Git submodules (experimental)",
+                    "default": true
+                },
                 "write-change-id-header": {
                     "type": "boolean",
                     "description": "Whether the change id should be stored in the Git commit object",
