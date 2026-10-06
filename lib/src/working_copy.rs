@@ -133,6 +133,12 @@ pub trait LockedWorkingCopy: Any + Send {
         Ok(CheckoutStats::default())
     }
 
+    /// Paths of populated Git submodules whose directories have changes that
+    /// aren't snapshotted. Nothing is changed.
+    async fn dirty_submodules(&mut self) -> Result<Vec<RepoPathBuf>, CheckoutError> {
+        Ok(vec![])
+    }
+
     /// Removes the populated contents of the Git submodule at `path`.
     async fn clear_submodule(&mut self, _path: &RepoPath) -> Result<CheckoutStats, CheckoutError> {
         Ok(CheckoutStats::default())

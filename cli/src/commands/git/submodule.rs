@@ -24,8 +24,10 @@ use jj_lib::git::get_git_repo;
 use jj_lib::git_submodule;
 use jj_lib::git_submodule::GitSubmoduleError;
 use jj_lib::git_submodule::SubmoduleConfig;
+use jj_lib::object_id::ObjectId as _;
 use jj_lib::repo::ReadonlyRepo;
 use jj_lib::repo::Repo as _;
+use jj_lib::repo_path::RepoPathBuf;
 
 use crate::cli_util::CommandHelper;
 use crate::cli_util::RevisionArg;
@@ -380,6 +382,54 @@ pub(crate) async fn fetch_stored_submodules(
         }
     }
     populate_submodules(ui, workspace_command).await
+}
+
+/// Submodules of `wc_commit` that need attention, as `(path, problem)`:
+/// not cloned, gitlink commit not fetched, or local changes jj doesn't record.
+pub(crate) async fn submodule_status(
+    workspace_command: &mut WorkspaceCommandHelper,
+    wc_commit: &Commit,
+) -> Result<Vec<(RepoPathBuf, String)>, CommandError> {
+    let repo = workspace_command.repo().clone();
+    let tree = wc_commit.tree();
+    let Ok(submodules) = git_submodule::read_gitmodules(repo.store(), &tree).await else {
+        return Ok(vec![]);
+    };
+    if submodules.is_empty() {
+        return Ok(vec![]);
+    }
+    let gitlinks = git_submodule::submodule_gitlinks(&tree, &submodules).await?;
+    let mut problems = vec![];
+    for (name, config) in &submodules {
+        let Some(gitlink) = gitlinks.get(name) else {
+            continue;
+        };
+        let problem = match repo.submodule_store().load_repo(name)? {
+            None => format!("not cloned; run `jj git submodule clone {name}`"),
+            Some(loader) if loader.store().get_commit(gitlink).is_err() => format!(
+                "commit {} not fetched; run `jj git submodule fetch {name}`",
+                gitlink.hex()
+            ),
+            Some(_) => continue,
+        };
+        problems.push((config.path.clone(), problem));
+    }
+    let (mut locked_ws, _) = workspace_command.start_working_copy_mutation().await?;
+    let dirty = locked_ws
+        .locked_wc()
+        .dirty_submodules()
+        .await
+        .map_err(|err| internal_error_with_message("Failed to inspect submodules", err))?;
+    // Dropped unfinished: nothing was changed.
+    drop(locked_ws);
+    problems.extend(dirty.into_iter().map(|path| {
+        (
+            path,
+            "has local changes, which jj does not record yet".to_owned(),
+        )
+    }));
+    problems.sort();
+    Ok(problems)
 }
 
 async fn cmd_submodule_list(

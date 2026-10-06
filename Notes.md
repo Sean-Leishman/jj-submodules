@@ -99,3 +99,21 @@ snapshotting, gitlink conflict handling.
   first `jj git fetch` warns; it syncs once the new commit is checked out.
 - Test gotcha: `git commit -a` in the superproject deletes the gitlink because
   the test removes git's submodule checkout; `git add .gitmodules` instead.
+
+### 2026-10-07 — submodules: `jj status` integration
+
+- `jj status` prints a `Submodules:` section for submodules of `@` that are
+  not cloned, whose gitlink commit isn't fetched, or that have local changes.
+- Dirty check needs the nested tree state, so: new default-no-op
+  `LockedWorkingCopy::dirty_submodules()` (local impl = `load_nested` +
+  `nested_is_dirty`). Status takes the wc lock for it and drops it unfinished
+  (nothing changes). Repos without `.gitmodules` return before the lock.
+- Cost: one throwaway nested snapshot per populated submodule per `jj status`
+  (bat-sized repo: ~92 nested snapshots). Fine for status; would be too much
+  on every command, which is the Phase 2 snapshotting problem anyway.
+- Ponytail: the status path filter doesn't apply to the submodule section.
+- Cleaned up the `--no-default-features` build: 10 warnings from the earlier
+  submodule commits (whole trait methods now `#[cfg(feature = "git")]`, relying
+  on the trait's default no-ops). 3 remaining CLI warnings are upstream.
+- Gotcha: `cargo insta test` without `--accept` reports "ok" with pending
+  snapshots; a mismatching snapshot does not fail the run.

@@ -21,7 +21,7 @@ mod init;
 mod push;
 mod remote;
 mod root;
-mod submodule;
+pub(crate) mod submodule;
 
 use std::io::Write as _;
 

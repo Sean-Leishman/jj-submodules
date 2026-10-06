@@ -2028,7 +2028,8 @@ fetch-submodules = false
 
 Submodules can then be managed manually with `jj git submodule`. Changes made
 inside a submodule directory are not snapshotted yet; a submodule with local
-changes is left alone by checkouts.
+changes is left alone by checkouts. `jj status` lists submodules that are not
+cloned, whose commit is not fetched, or that have local changes.
 
 ### Abandon commits that became unreachable in Git
 

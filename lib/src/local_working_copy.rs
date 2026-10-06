@@ -63,6 +63,7 @@ use tracing::instrument;
 use tracing::trace_span;
 
 use crate::backend::BackendError;
+#[cfg(feature = "git")]
 use crate::backend::CommitId;
 use crate::backend::CopyId;
 use crate::backend::FileId;
@@ -102,6 +103,7 @@ use crate::matchers::EverythingMatcher;
 use crate::matchers::FilesMatcher;
 use crate::matchers::IntersectionMatcher;
 use crate::matchers::Matcher;
+#[cfg(feature = "git")]
 use crate::matchers::NothingMatcher;
 use crate::matchers::PrefixMatcher;
 use crate::matchers::UnionMatcher;
@@ -2993,6 +2995,7 @@ fn submodule_state_error(
     }
 }
 
+#[cfg(feature = "git")]
 impl LockedLocalWorkingCopy {
     /// Where the tree state of the populated submodule at `path` is kept.
     fn submodule_state_path(&self, path: &RepoPath) -> PathBuf {
@@ -3005,7 +3008,6 @@ impl LockedLocalWorkingCopy {
     }
 
     /// Paths of submodules that currently have populated state.
-    #[cfg(feature = "git")]
     fn populated_submodule_paths(&self) -> Vec<RepoPathBuf> {
         let Ok(entries) = fs::read_dir(self.wc.state_path.join("submodules")) else {
             return vec![];
@@ -3285,6 +3287,7 @@ impl LockedWorkingCopy for LockedLocalWorkingCopy {
         if old_tree.tree_ids_and_labels() == new_tree.tree_ids_and_labels() {
             return Ok(CheckoutStats::default());
         }
+        #[cfg(feature = "git")]
         let matcher = self.wc.tree_state()?.sparse_matcher();
         let mut stats = CheckoutStats::default();
         // Submodule contents must be removed before the superproject update
@@ -3327,21 +3330,40 @@ impl LockedWorkingCopy for LockedLocalWorkingCopy {
         Ok(stats)
     }
 
+    #[cfg(feature = "git")]
     async fn populate_submodules(&mut self) -> Result<CheckoutStats, CheckoutError> {
         let mut stats = CheckoutStats::default();
-        #[cfg(feature = "git")]
-        {
-            let tree = self.wc.tree_state()?.current_tree().clone();
-            let matcher = self.wc.tree_state()?.sparse_matcher();
-            self.populate_submodules_in(&tree, matcher.as_ref(), &[], &mut stats)
-                .await?;
-        }
+        let tree = self.wc.tree_state()?.current_tree().clone();
+        let matcher = self.wc.tree_state()?.sparse_matcher();
+        self.populate_submodules_in(&tree, matcher.as_ref(), &[], &mut stats)
+            .await?;
         Ok(stats)
     }
 
+    #[cfg(feature = "git")]
+    async fn dirty_submodules(&mut self) -> Result<Vec<RepoPathBuf>, CheckoutError> {
+        let mut dirty = vec![];
+        let populated = self.populated_submodule_paths();
+        if populated.is_empty() {
+            return Ok(dirty);
+        }
+        let tree = self.wc.tree_state()?.current_tree().clone();
+        let names = gitmodules_by_path(&self.wc.store, &tree).await;
+        for path in populated {
+            if let Some(name) = names.get(&path)
+                && let Some((_, mut state)) =
+                    self.load_nested(&path, name, &mut CheckoutStats::default())?
+                && nested_is_dirty(&mut state)?
+            {
+                dirty.push(path);
+            }
+        }
+        Ok(dirty)
+    }
+
+    #[cfg(feature = "git")]
     async fn clear_submodule(&mut self, path: &RepoPath) -> Result<CheckoutStats, CheckoutError> {
         let mut stats = CheckoutStats::default();
-        #[cfg(feature = "git")]
         if self.submodule_state_path(path).exists() {
             let tree = self.wc.tree_state()?.current_tree().clone();
             let store = self.wc.store.clone();
@@ -3394,7 +3416,9 @@ impl LockedWorkingCopy for LockedLocalWorkingCopy {
     ) -> Result<CheckoutStats, CheckoutError> {
         // TODO: Write a "pending_checkout" file with new sparse patterns so we can
         // continue an interrupted update if we find such a file.
+        #[cfg(feature = "git")]
         let tree = self.wc.tree_state()?.current_tree().clone();
+        #[cfg(feature = "git")]
         let new_matcher = PrefixMatcher::new(&new_sparse_patterns);
         let mut stats = CheckoutStats::default();
         #[cfg(feature = "git")]

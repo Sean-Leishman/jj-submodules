@@ -129,6 +129,15 @@ fn test_git_submodule_clone_fetch_delete() {
     Done importing changes from the underlying Git repo.
     [EOF]
     ");
+    let output = work_dir.run_jj(["status"]);
+    insta::assert_snapshot!(output, @"
+    The working copy has no changes.
+    Submodules:
+      sub: not cloned; run `jj git submodule clone sub`
+    Working copy  (@) : 
+    Parent commit (@-): Add submodule
+    [EOF]
+    ");
 
     let output = work_dir.run_jj(["git", "submodule", "clone", "nope"]);
     insta::assert_snapshot!(output, @r#"
@@ -250,6 +259,8 @@ fn test_git_submodule_clone_fetch_delete() {
     let output = work_dir.run_jj(["status"]);
     insta::assert_snapshot!(output, @"
     The working copy has no changes.
+    Submodules:
+      sub: has local changes, which jj does not record yet
     Working copy  (@) : 
     Parent commit (@-): Add submodule
     [EOF]

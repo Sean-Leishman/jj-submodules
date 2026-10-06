@@ -71,14 +71,26 @@ pub(crate) async fn cmd_status(
     command: &CommandHelper,
     args: &StatusArgs,
 ) -> Result<(), CommandError> {
-    let (workspace_command, snapshot_stats, _) = command.workspace_helper_with_stats(ui).await?;
+    #[cfg_attr(not(feature = "git"), expect(unused_mut))]
+    let (mut workspace_command, snapshot_stats, _) =
+        command.workspace_helper_with_stats(ui).await?;
     print_snapshot_stats(
         ui,
         &snapshot_stats,
         workspace_command.env().path_converter(),
     )?;
-    let repo = workspace_command.repo();
     let maybe_wc_commit = workspace_command.get_wc_commit().await?;
+    #[cfg(feature = "git")]
+    let submodule_problems = match &maybe_wc_commit {
+        Some(wc_commit) => {
+            crate::commands::git::submodule::submodule_status(&mut workspace_command, wc_commit)
+                .await?
+        }
+        None => vec![],
+    };
+    #[cfg(not(feature = "git"))]
+    let submodule_problems: Vec<(jj_lib::repo_path::RepoPathBuf, String)> = vec![];
+    let repo = workspace_command.repo();
     let fileset_expression = workspace_command.parse_file_patterns(ui, &args.paths)?;
     let matcher = fileset_expression.to_matcher();
     ui.request_pager();
@@ -141,6 +153,14 @@ pub(crate) async fn cmd_status(
                     },
                 )
                 .await?;
+            }
+        }
+
+        if !submodule_problems.is_empty() {
+            writeln!(formatter, "Submodules:")?;
+            for (path, problem) in &submodule_problems {
+                let ui_path = workspace_command.path_converter().format_file_path(path);
+                writeln!(formatter, "  {ui_path}: {problem}")?;
             }
         }
 
