@@ -18,10 +18,13 @@ use std::io::Write as _;
 use clap::Subcommand;
 use jj_lib::backend::CommitId;
 use jj_lib::commit::Commit;
+use jj_lib::git;
 use jj_lib::git::get_git_backend;
+use jj_lib::git::get_git_repo;
 use jj_lib::git_submodule;
 use jj_lib::git_submodule::GitSubmoduleError;
 use jj_lib::git_submodule::SubmoduleConfig;
+use jj_lib::repo::ReadonlyRepo;
 use jj_lib::repo::Repo as _;
 
 use crate::cli_util::CommandHelper;
@@ -180,23 +183,42 @@ async fn clone_one(
 ) -> Result<(), CommandError> {
     let repo = workspace_command.repo();
     let object_hash = get_git_backend(repo.store())?.git_repo().object_hash();
+    let url = resolve_url(workspace_command, &config.url);
     writeln!(
         ui.status(),
-        "Cloning submodule {:?} from {}",
-        config.name,
-        config.url
+        "Cloning submodule {:?} from {url}",
+        config.name
     )?;
     let stats = git_submodule::clone_submodule(
         repo.submodule_store().as_ref(),
         workspace_command.settings(),
         &config.name,
-        &config.url,
+        &url,
         object_hash,
         gitlink.map(std::slice::from_ref).unwrap_or_default(),
         &mut GitSubprocessUi::new(ui),
     )
     .await?;
     print_git_import_stats_summary(ui, &stats)
+}
+
+fn fetch_url(repo: &ReadonlyRepo, remote: &str) -> Option<String> {
+    let git_repo = get_git_repo(repo.store()).ok()?;
+    let remote = git_repo.try_find_remote_without_url_rewrite(remote)?.ok()?;
+    Some(
+        remote
+            .url(gix::remote::Direction::Fetch)?
+            .to_bstring()
+            .to_string(),
+    )
+}
+
+/// Resolves a `.gitmodules` URL against the superproject's remote.
+// ponytail: always "origin"; Git prefers the current branch's upstream remote.
+fn resolve_url(workspace_command: &WorkspaceCommandHelper, url: &str) -> String {
+    let base = fetch_url(workspace_command.repo(), "origin")
+        .unwrap_or_else(|| workspace_command.workspace_root().display().to_string());
+    git_submodule::resolve_submodule_url(url, &base)
 }
 
 pub(crate) async fn populate_submodules(
@@ -275,17 +297,18 @@ async fn cmd_submodule_fetch(
     } else {
         args.names.clone()
     };
-    fetch_stored_submodules(ui, &mut workspace_command, &names, &[]).await
+    fetch_stored_submodules(ui, &mut workspace_command, &names, &[], false).await
 }
 
 /// Fetches the given stored submodules, asking by hash for the gitlinks of the
 /// working-copy commit and `also_scan` if branches and tags didn't bring them,
-/// then populates.
+/// then populates. With `best_effort`, a failed fetch is a warning.
 pub(crate) async fn fetch_stored_submodules(
     ui: &mut Ui,
     workspace_command: &mut WorkspaceCommandHelper,
     names: &[String],
     also_scan: &[CommitId],
+    best_effort: bool,
 ) -> Result<(), CommandError> {
     if names.is_empty() {
         return Ok(());
@@ -293,9 +316,19 @@ pub(crate) async fn fetch_stored_submodules(
     let repo = workspace_command.repo().clone();
     let store = repo.submodule_store();
     let mut gitlinks: HashMap<String, Vec<CommitId>> = HashMap::new();
-    for id in workspace_command.get_wc_commit_id().into_iter().chain(also_scan) {
+    // URLs come from the working-copy commit, the first one scanned.
+    let mut urls: HashMap<String, String> = HashMap::new();
+    for id in workspace_command
+        .get_wc_commit_id()
+        .into_iter()
+        .chain(also_scan)
+    {
         let tree = repo.store().get_commit(id)?.tree();
         let submodules = git_submodule::read_gitmodules(repo.store(), &tree).await?;
+        for config in submodules.values() {
+            urls.entry(config.name.clone())
+                .or_insert_with(|| resolve_url(workspace_command, &config.url));
+        }
         for (name, gitlink) in git_submodule::submodule_gitlinks(&tree, &submodules).await? {
             let ids = gitlinks.entry(name).or_default();
             if !ids.contains(&gitlink) {
@@ -308,16 +341,43 @@ pub(crate) async fn fetch_stored_submodules(
             writeln!(ui.warning_default(), "Submodule {name:?} is not cloned")?;
             continue;
         };
-        let sub_repo = loader.load_at_head().await?;
+        let mut sub_repo = loader.load_at_head().await?;
+        // Follow URL changes in .gitmodules, like `git submodule sync`.
+        if let Some(url) = urls.get(name)
+            && fetch_url(&sub_repo, git_submodule::SUBMODULE_REMOTE.as_str()).as_ref() != Some(url)
+        {
+            writeln!(ui.status(), "Updating URL of submodule {name:?} to {url}")?;
+            git::set_remote_urls(
+                sub_repo.store(),
+                git_submodule::SUBMODULE_REMOTE,
+                Some(url),
+                None,
+            )?;
+            // Reload so the gix repo behind the store sees the new URL.
+            sub_repo = store
+                .load_repo(name)?
+                .expect("loaded above")
+                .load_at_head()
+                .await?;
+        }
         writeln!(ui.status(), "Fetching submodule {name:?}")?;
-        let stats = git_submodule::fetch_submodule(
+        let result = git_submodule::fetch_submodule(
             &sub_repo,
             workspace_command.settings(),
             gitlinks.get(name).map(Vec::as_slice).unwrap_or_default(),
             &mut GitSubprocessUi::new(ui),
         )
-        .await?;
-        print_git_import_stats_summary(ui, &stats)?;
+        .await;
+        match result {
+            Ok(stats) => print_git_import_stats_summary(ui, &stats)?,
+            Err(err) if best_effort => {
+                writeln!(
+                    ui.warning_default(),
+                    "Failed to fetch submodule {name:?}: {err}"
+                )?;
+            }
+            Err(err) => return Err(err.into()),
+        }
     }
     populate_submodules(ui, workspace_command).await
 }

@@ -191,6 +191,37 @@ pub fn gitmodules_by_path(
         .collect()
 }
 
+/// Resolves a `.gitmodules` URL like Git does: `./x` and `../x` are relative
+/// to `base`, the superproject's remote URL (or its path if it has no remote).
+/// Other URLs are returned unchanged.
+pub fn resolve_submodule_url(url: &str, base: &str) -> String {
+    if !url.starts_with("./") && !url.starts_with("../") {
+        return url.to_owned();
+    }
+    let mut base = base.trim_end_matches('/');
+    let mut rest = url;
+    loop {
+        if let Some(r) = rest.strip_prefix("./") {
+            rest = r;
+        } else if let Some(r) = rest.strip_prefix("../") {
+            rest = r;
+            // Drop the last component; for scp-like `host:path`, keep the ':'.
+            base = match base.rfind(['/', ':']) {
+                Some(i) if base.as_bytes()[i] == b':' => &base[..=i],
+                Some(i) => &base[..i],
+                None => "",
+            };
+        } else {
+            break;
+        }
+    }
+    if base.is_empty() || base.ends_with(':') {
+        format!("{base}{rest}")
+    } else {
+        format!("{base}/{rest}")
+    }
+}
+
 /// Creates a new workspace-less repo for submodule `name` in `store` and
 /// fetches all branches and tags from `url`.
 pub async fn clone_submodule(
@@ -349,5 +380,21 @@ mod tests {
         assert_eq!(parsed["bar"].url, "../bar.git");
         assert!(parse_gitmodules(b"").unwrap().is_empty());
         assert!(parse_gitmodules(b"[submodule \"x\"\npath=").is_err());
+    }
+
+    #[test]
+    fn test_resolve_submodule_url() {
+        let resolve = resolve_submodule_url;
+        let https = "https://example.com/org/repo.git";
+        assert_eq!(resolve("https://x/y.git", https), "https://x/y.git");
+        assert_eq!(
+            resolve("../sub.git", https),
+            "https://example.com/org/sub.git"
+        );
+        assert_eq!(resolve("../../o/s", https), "https://example.com/o/s");
+        assert_eq!(resolve("./sub", "https://h/repo/"), "https://h/repo/sub");
+        assert_eq!(resolve("../sub", "git@h:org/repo"), "git@h:org/sub");
+        assert_eq!(resolve("../sub", "git@h:repo"), "git@h:sub");
+        assert_eq!(resolve("../sub", "/tmp/repo"), "/tmp/sub");
     }
 }

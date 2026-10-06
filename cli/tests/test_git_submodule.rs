@@ -477,3 +477,80 @@ fn test_git_submodule_auto_clone_and_fetch() {
     [EOF]
     ");
 }
+
+#[test]
+fn test_git_submodule_relative_and_changed_url() {
+    let test_env = TestEnvironment::default();
+    let work_dir = set_up_superproject(&test_env);
+    let git_commit = |work_dir: &TestWorkDir, script: &str| {
+        work_dir
+            .run_jj_with(|cmd| {
+                cmd.env("GIT_AUTHOR_DATE", "2001-02-03T04:05:06+07:00")
+                    .env("GIT_COMMITTER_DATE", "2001-02-03T04:05:06+07:00")
+                    .args(["util", "exec", "--", "sh", "-c", script])
+            })
+            .success();
+    };
+    let commit = "git -c user.email=test@example.com -c user.name='Test user' commit -qm";
+    git_commit(
+        &work_dir,
+        &format!(
+            "git config -f .gitmodules submodule.sub.url ../submodule && git add .gitmodules && {commit} relative"
+        ),
+    );
+
+    // The relative URL resolves against the superproject's origin.
+    let output = test_env.run_jj_in(
+        ".",
+        [
+            "git",
+            "clone",
+            &format!("{}/repo", test_env.env_root().display()),
+            "clone",
+        ],
+    );
+    insta::assert_snapshot!(output, @r#"
+    ------- stderr -------
+    Fetching into new repo in "$TEST_ENV/clone"
+    bookmark: master@origin [new] tracked
+    Setting the revset alias `trunk()` to `master@origin`.
+    Cloning submodule "sub" from $TEST_ENV/submodule
+    Working copy  (@) now at: 
+    Parent commit (@-)      : relative
+    Added 3 files, modified 0 files, removed 0 files
+    [EOF]
+    "#);
+    let clone_dir = test_env.work_dir("clone");
+    assert!(clone_dir.root().join("sub/sub").exists());
+
+    // The submodule moves; fetch follows the new URL once it's checked out.
+    std::fs::rename(
+        test_env.env_root().join("submodule"),
+        test_env.env_root().join("moved"),
+    )
+    .unwrap();
+    git_commit(
+        &work_dir,
+        &format!(
+            "git config -f .gitmodules submodule.sub.url ../moved && git add .gitmodules && {commit} moved"
+        ),
+    );
+    // Until then, the old URL fails, but only as a warning.
+    let output = clone_dir.run_jj(["git", "fetch"]);
+    insta::assert_snapshot!(output, @r#"
+    ------- stderr -------
+    Fetching from Git remotes: origin
+    bookmark: master@origin [updated] tracked
+    Fetching submodule "sub"
+    Warning: Failed to fetch submodule "sub": Could not find repository at '$TEST_ENV/submodule'
+    [EOF]
+    "#);
+    clone_dir.run_jj(["new", "master@origin"]).success();
+    let output = clone_dir.run_jj(["git", "submodule", "fetch"]);
+    insta::assert_snapshot!(output, @r#"
+    ------- stderr -------
+    Updating URL of submodule "sub" to $TEST_ENV/moved
+    Fetching submodule "sub"
+    [EOF]
+    "#);
+}

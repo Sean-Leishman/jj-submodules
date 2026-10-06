@@ -80,3 +80,22 @@ panic in builtin merge tool still open).
 
 Still not done: `jj git submodule sync`, `jj status` integration, Phase 2
 snapshotting, gitlink conflict handling.
+
+### 2026-10-06 — submodules: relative URLs, URL sync on fetch
+
+- Bug found: relative `.gitmodules` URLs (`../x.git`) were passed through
+  raw. Now resolved like Git via `resolve_submodule_url` against the
+  superproject's `origin` fetch URL (fallback: workspace root). Handles
+  scp-like `host:path`. Ponytail: always `origin`; Git prefers the current
+  branch's upstream remote.
+- No `jj git submodule sync` command: fetch compares the submodule's stored
+  origin URL with the (resolved) URL from `@`'s `.gitmodules` and updates it.
+  Must re-`load_repo` afterwards; `load_at_head` on the old loader keeps the
+  stale gix config.
+- Auto-fetch from `jj git fetch` is now best effort (dead submodule URL was
+  failing the whole fetch after the superproject fetch succeeded); explicit
+  `jj git submodule fetch` still errors.
+- Known wrinkle: URLs come from `@`, so after upstream moves a submodule the
+  first `jj git fetch` warns; it syncs once the new commit is checked out.
+- Test gotcha: `git commit -a` in the superproject deletes the gitlink because
+  the test removes git's submodule checkout; `git add .gitmodules` instead.

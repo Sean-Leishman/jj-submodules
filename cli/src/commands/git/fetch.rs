@@ -262,7 +262,7 @@ pub async fn cmd_git_fetch(
             .iter()
             .filter_map(|update| update.new_target.as_normal().cloned())
             .collect();
-        fetch_stored_submodules(ui, &mut workspace_command, &names, &updated).await?;
+        fetch_stored_submodules(ui, &mut workspace_command, &names, &updated, true).await?;
     }
     Ok(())
 }

@@ -2016,7 +2016,9 @@ track-default-bookmark-on-clone = false
 
 `jj git clone` clones the Git submodules declared in the checked-out commit's
 `.gitmodules` and populates their directories, and `jj git fetch` also fetches
-already-cloned submodules. Both are best effort and can be turned off:
+already-cloned submodules, following URL changes in the working-copy commit's
+`.gitmodules`. Relative URLs (`../foo.git`) resolve against the `origin`
+remote, as in Git. Both are best effort and can be turned off:
 
 ```toml
 [git]
