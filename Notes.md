@@ -117,3 +117,21 @@ snapshotting, gitlink conflict handling.
   on the trait's default no-ops). 3 remaining CLI warnings are upstream.
 - Gotcha: `cargo insta test` without `--accept` reports "ok" with pending
   snapshots; a mismatching snapshot does not fail the run.
+
+### 2026-10-07 — falsifier for Phase 2 (snapshot submodules every command): timing on bat
+
+Release build, warm cache, tmpfs, hyperfine 15 runs. bat: superproject 1007
+files, 93 populated submodules, 7865 files total (via the new auto-clone on
+`jj git clone`: 92s, no failures).
+- `jj log -r @` (superproject snapshot only): 17 ms
+- `jj status`, nested states hidden (93 `load_repo` + `get_commit`): 54 ms
+- `jj status` full (+93 throwaway nested snapshots): 168 ms
+- Control: same 7772 files flat in one plain repo, `jj log -r @`: 30 ms
+
+So per-file cost is ~2 µs (cheap); the ~115 ms of nested snapshots is ~1.2 ms
+fixed cost per submodule (gix repo open + store + `TreeState::load`, run
+serially), and repo loading alone is ~0.4 ms each.
+Verdict: Phase 2 is NOT killed, but naive per-command nested snapshots would
+add ~150 ms on a 93-submodule repo. Needed first: skip submodules whose
+directory is unchanged (cheap stat of the nested state / dir mtimes before
+loading anything), load stores lazily, and run nested snapshots in parallel.
