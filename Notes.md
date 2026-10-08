@@ -151,3 +151,15 @@ loading anything), load stores lazily, and run nested snapshots in parallel.
 - Unit test moves the state file's mtime ±1h (ctime can't be set).
 - Benchmark on bat NOT rerun yet: release rebuild was killed by the harness
   for low system memory. Expected ~168 ms → ~65 ms for `jj status`.
+- Follow-up same day, measured on bat (dev profile at opt-level 3, since a
+  release build gets killed for low memory): the skip first did NOTHING
+  (172 ms both ways). Cause: Linux file timestamps come from a coarse clock,
+  so populate's last files and the saved `tree_state` share an mtime to the
+  ns; the conservative `>=` flagged every submodule, and the throwaway check
+  never re-saved. Fix (racy-git style): when the full check finds a submodule
+  clean, `dirty_submodules` saves its state (same tree, refreshed file
+  states), moving the mtime past the tick. Result: `jj status` 172 → 71.5 ms
+  (`jj log -r @` 21 ms). Edit inside a submodule still detected; revert
+  clears it.
+- A/B trick without two builds: `touch` every submodule dir forces the full
+  path in the same binary.

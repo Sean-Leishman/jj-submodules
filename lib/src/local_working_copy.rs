@@ -3406,12 +3406,23 @@ impl LockedWorkingCopy for LockedLocalWorkingCopy {
             if !nested_maybe_dirty(&self.submodule_state_path(&path), &disk_dir) {
                 continue;
             }
-            if let Some(name) = names.get(&path)
-                && let Some((_, mut state)) =
-                    self.load_nested(&path, name, &mut CheckoutStats::default())?
-                && nested_is_dirty(&mut state)?
-            {
+            let Some(name) = names.get(&path) else {
+                continue;
+            };
+            let Some((_, mut state)) =
+                self.load_nested(&path, name, &mut CheckoutStats::default())?
+            else {
+                continue;
+            };
+            if nested_is_dirty(&mut state)? {
                 dirty.push(path);
+            } else {
+                // Same tree, refreshed file states: saving moves the state's
+                // mtime past files written in the same clock tick, so the
+                // next nested_maybe_dirty() can skip this submodule.
+                state
+                    .save()
+                    .map_err(|err| submodule_state_error("Failed to save submodule state", err))?;
             }
         }
         Ok(dirty)
@@ -3568,10 +3579,16 @@ mod tests {
         let state = File::create(state_path.join("tree_state")).unwrap();
         let hour = Duration::from_secs(3600);
         state.set_modified(SystemTime::now() + hour).unwrap();
-        assert!(!nested_maybe_dirty(&state_path, &dir), "saved after all changes");
+        assert!(
+            !nested_maybe_dirty(&state_path, &dir),
+            "saved after all changes"
+        );
         state.set_modified(SystemTime::now() - hour).unwrap();
         assert!(nested_maybe_dirty(&state_path, &dir), "changed after save");
-        assert!(nested_maybe_dirty(&state_path, &temp_dir.path().join("gone")));
+        assert!(nested_maybe_dirty(
+            &state_path,
+            &temp_dir.path().join("gone")
+        ));
     }
 
     fn repo_path_component(value: &str) -> &RepoPathComponent {
