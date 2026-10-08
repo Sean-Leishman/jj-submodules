@@ -3061,6 +3061,58 @@ fn nested_is_dirty(state: &mut TreeState) -> Result<bool, CheckoutError> {
     Ok((ids, labels) != (&before.0, &before.1))
 }
 
+/// Cheap pre-check for [`nested_is_dirty`]: false only if nothing under `dir`
+/// (files, symlinks, directories) changed after the nested tree state at
+/// `state_path` was last saved, so loading the submodule can be skipped.
+/// Conservative: equal timestamps, unreadable entries or a missing state count
+/// as maybe dirty.
+// ponytail: walks every entry, ignored ones too (a build dir inside a
+// submodule makes it "maybe dirty" every time); prune ignored dirs if that
+// shows up in profiles.
+#[cfg(feature = "git")]
+fn nested_maybe_dirty(state_path: &Path, dir: &Path) -> bool {
+    fn changed_at(metadata: &Metadata) -> Option<SystemTime> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            // ctime also covers chmod and renames, which leave mtime alone.
+            let ctime = SystemTime::UNIX_EPOCH
+                + std::time::Duration::new(
+                    u64::try_from(metadata.ctime()).ok()?,
+                    u32::try_from(metadata.ctime_nsec()).ok()?,
+                );
+            Some(ctime.max(metadata.modified().ok()?))
+        }
+        #[cfg(not(unix))]
+        metadata.modified().ok()
+    }
+    fn changed_since(dir: &Path, saved: SystemTime) -> bool {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return true;
+        };
+        entries.into_iter().any(|entry| {
+            let Ok(entry) = entry else { return true };
+            let Ok(metadata) = entry.path().symlink_metadata() else {
+                return true;
+            };
+            changed_at(&metadata).is_none_or(|t| t >= saved)
+                || (metadata.is_dir() && changed_since(&entry.path(), saved))
+        })
+    }
+    let Some(saved) = state_path
+        .join("tree_state")
+        .symlink_metadata()
+        .ok()
+        .and_then(|m| m.modified().ok())
+    else {
+        return true;
+    };
+    let Ok(metadata) = dir.symlink_metadata() else {
+        return true;
+    };
+    changed_at(&metadata).is_none_or(|t| t >= saved) || changed_since(dir, saved)
+}
+
 #[cfg(feature = "git")]
 const DIRTY_SUBMODULE: &str =
     "it has local changes, which jj cannot snapshot yet; the directory was left as is";
@@ -3350,6 +3402,10 @@ impl LockedWorkingCopy for LockedLocalWorkingCopy {
         let tree = self.wc.tree_state()?.current_tree().clone();
         let names = gitmodules_by_path(&self.wc.store, &tree).await;
         for path in populated {
+            let disk_dir = path.to_fs_path(&self.wc.working_copy_path)?;
+            if !nested_maybe_dirty(&self.submodule_state_path(&path), &disk_dir) {
+                continue;
+            }
             if let Some(name) = names.get(&path)
                 && let Some((_, mut state)) =
                     self.load_nested(&path, name, &mut CheckoutStats::default())?
@@ -3496,6 +3552,26 @@ mod tests {
 
     fn repo_path(value: &str) -> &RepoPath {
         RepoPath::from_internal_string(value).unwrap()
+    }
+
+    #[cfg(feature = "git")]
+    #[test]
+    fn test_nested_maybe_dirty() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let state_path = temp_dir.path().join("state");
+        let dir = temp_dir.path().join("sub");
+        fs::create_dir_all(dir.join("a/b")).unwrap();
+        fs::write(dir.join("a/b/file"), "x").unwrap();
+        fs::create_dir(&state_path).unwrap();
+        assert!(nested_maybe_dirty(&state_path, &dir), "no saved state");
+
+        let state = File::create(state_path.join("tree_state")).unwrap();
+        let hour = Duration::from_secs(3600);
+        state.set_modified(SystemTime::now() + hour).unwrap();
+        assert!(!nested_maybe_dirty(&state_path, &dir), "saved after all changes");
+        state.set_modified(SystemTime::now() - hour).unwrap();
+        assert!(nested_maybe_dirty(&state_path, &dir), "changed after save");
+        assert!(nested_maybe_dirty(&state_path, &temp_dir.path().join("gone")));
     }
 
     fn repo_path_component(value: &str) -> &RepoPathComponent {

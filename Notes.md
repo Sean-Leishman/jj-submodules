@@ -135,3 +135,19 @@ Verdict: Phase 2 is NOT killed, but naive per-command nested snapshots would
 add ~150 ms on a 93-submodule repo. Needed first: skip submodules whose
 directory is unchanged (cheap stat of the nested state / dir mtimes before
 loading anything), load stores lazily, and run nested snapshots in parallel.
+
+### 2026-10-08 — submodules: skip unchanged submodules before loading them
+
+- `nested_maybe_dirty(state_path, dir)`: walks the submodule dir and returns
+  false only if every entry's max(mtime, ctime) is older than the nested
+  `tree_state` file's mtime. ctime catches chmod/renames that keep mtime.
+  Equal timestamps, unreadable entries, missing state → "maybe dirty" (full
+  check). Windows: mtime only.
+- Wired into `dirty_submodules` (jj status) only; it's also the gate Phase 2's
+  per-command nested snapshot will need.
+- Limitation: walks ignored files too; a build dir inside a submodule keeps it
+  "maybe dirty". Also the throwaway dirty check never saves state, so a
+  submodule edited then reverted stays "maybe dirty" until repopulated.
+- Unit test moves the state file's mtime ±1h (ctime can't be set).
+- Benchmark on bat NOT rerun yet: release rebuild was killed by the harness
+  for low system memory. Expected ~168 ms → ~65 ms for `jj status`.
