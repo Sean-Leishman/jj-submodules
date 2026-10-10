@@ -183,3 +183,23 @@ loading anything), load stores lazily, and run nested snapshots in parallel.
   nothing), so it's `next@origin`, not `next`. The error hint says so.
 - Fixed stale design-doc line (auto clone/fetch) and CHANGELOG entry.
 - Next Phase 1 item: view submodule history from the superproject.
+
+### 2026-10-10 — `jj git submodule log` (last Phase 1 outcome)
+
+- Chose a dedicated read-only subcommand over a global `--submodule` flag
+  (cheapest way to meet "submodule history and branches can be viewed"; the
+  flag is a global CLI change for maintainers to weigh in on).
+- Revsets parsed in the superproject, evaluated in the submodule repo (same
+  as `set`). Default is self-contained: `ancestors(present(<gitlink of @>) |
+  remote_bookmarks(), 10)`. `revsets.log`/`trunk()` would name superproject
+  bookmarks.
+- Gotcha found by test: templates' `immutable` evaluates the superproject's
+  `immutable_heads()` in the submodule → "Revision master@origin doesn't
+  exist" after `jj git clone` sets trunk(). Fix: new
+  `WorkspaceCommandEnvironment::commit_template_language_with_immutable`;
+  submodule log passes `all()` (read-only in Phase 1).
+- Graph loop is a trimmed copy of cmd_log's (no prioritization, elided nodes,
+  patches); marked ponytail.
+- Not done: marking which commit the superproject points at in the graph.
+- With this, all six Phase 1 outcomes have a CLI path. The conflict one is
+  CLI-only (`set`); the builtin merge tool panic (#7386) is still open.

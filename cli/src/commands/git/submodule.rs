@@ -14,11 +14,13 @@
 
 use std::collections::HashMap;
 use std::io::Write as _;
+use std::sync::Arc;
 
 use futures::StreamExt as _;
 use futures::TryStreamExt as _;
 
 use clap::Subcommand;
+use itertools::Itertools as _;
 use jj_lib::backend::CommitId;
 use jj_lib::backend::TreeValue;
 use jj_lib::commit::Commit;
@@ -28,22 +30,29 @@ use jj_lib::git::get_git_repo;
 use jj_lib::git_submodule;
 use jj_lib::git_submodule::GitSubmoduleError;
 use jj_lib::git_submodule::SubmoduleConfig;
+use jj_lib::graph::GraphEdge;
+use jj_lib::graph::GraphEdgeType;
 use jj_lib::id_prefix::IdPrefixContext;
 use jj_lib::merged_tree_builder::MergedTreeBuilder;
 use jj_lib::object_id::ObjectId as _;
 use jj_lib::repo::ReadonlyRepo;
 use jj_lib::repo::Repo as _;
 use jj_lib::repo_path::RepoPathBuf;
+use jj_lib::revset::RevsetExpression;
 
 use crate::cli_util::CommandHelper;
+use crate::cli_util::LogContentFormat;
 use crate::cli_util::RevisionArg;
 use crate::cli_util::WorkspaceCommandHelper;
+use crate::cli_util::format_template;
 use crate::cli_util::print_checkout_stats;
 use crate::command_error::CommandError;
 use crate::command_error::internal_error_with_message;
 use crate::command_error::user_error;
 use crate::git_util::GitSubprocessUi;
 use crate::git_util::print_git_import_stats_summary;
+use crate::graphlog::GraphStyle;
+use crate::graphlog::get_graphlog;
 use crate::revset_util::RevsetExpressionEvaluator;
 use crate::ui::Ui;
 
@@ -60,6 +69,7 @@ pub enum GitSubmoduleCommand {
     Delete(SubmoduleDeleteArgs),
     Fetch(SubmoduleFetchArgs),
     List(SubmoduleListArgs),
+    Log(SubmoduleLogArgs),
     Populate(SubmodulePopulateArgs),
     PrintGitmodules(SubmodulePrintGitmodulesArgs),
     Set(SubmoduleSetArgs),
@@ -97,6 +107,28 @@ pub struct SubmoduleFetchArgs {
 /// List submodules in the submodule store
 #[derive(clap::Args, Clone, Debug)]
 pub struct SubmoduleListArgs {}
+
+/// Show the commit history of a submodule
+///
+/// Revsets are parsed with the superproject's aliases and evaluated in the
+/// submodule repo, which has remote bookmarks (`main@origin`) but no local
+/// ones. Templates are the superproject's `templates.log`.
+#[derive(clap::Args, Clone, Debug)]
+pub struct SubmoduleLogArgs {
+    /// Name of the submodule
+    name: String,
+    /// Which submodule revisions to show [default: the commit the working-copy
+    /// commit's gitlink points at, the remote bookmarks, and up to 10
+    /// generations of their ancestors]
+    #[arg(long, short, value_name = "REVSETS")]
+    revisions: Option<RevisionArg>,
+    /// Limit number of revisions to show
+    #[arg(long, short = 'n')]
+    limit: Option<usize>,
+    /// Render each revision using the given template
+    #[arg(long, short = 'T')]
+    template: Option<String>,
+}
 
 /// Populate submodule directories in the working copy
 ///
@@ -141,6 +173,7 @@ pub async fn cmd_git_submodule(
         GitSubmoduleCommand::Delete(args) => cmd_submodule_delete(ui, command, args).await,
         GitSubmoduleCommand::Fetch(args) => cmd_submodule_fetch(ui, command, args).await,
         GitSubmoduleCommand::List(args) => cmd_submodule_list(ui, command, args).await,
+        GitSubmoduleCommand::Log(args) => cmd_submodule_log(ui, command, args).await,
         GitSubmoduleCommand::Populate(args) => cmd_submodule_populate(ui, command, args).await,
         GitSubmoduleCommand::Set(args) => cmd_submodule_set(ui, command, args).await,
         GitSubmoduleCommand::PrintGitmodules(args) => {
@@ -505,10 +538,7 @@ async fn cmd_submodule_set(
             args.name
         )));
     };
-    let Some(loader) = repo.submodule_store().load_repo(&args.name)? else {
-        return Err(GitSubmoduleError::NotCloned(args.name.clone()).into());
-    };
-    let sub_repo = loader.load_at_head().await?;
+    let sub_repo = load_submodule(&repo, &args.name).await?;
     // Parsed with the superproject's aliases, resolved in the submodule repo.
     let expression = workspace_command
         .parse_revset(ui, &args.submodule_revision)?
@@ -556,6 +586,116 @@ async fn cmd_submodule_set(
         ),
     )
     .await
+}
+
+async fn load_submodule(
+    repo: &ReadonlyRepo,
+    name: &str,
+) -> Result<Arc<ReadonlyRepo>, CommandError> {
+    let Some(loader) = repo.submodule_store().load_repo(name)? else {
+        return Err(GitSubmoduleError::NotCloned(name.to_owned()).into());
+    };
+    Ok(loader.load_at_head().await?)
+}
+
+// ponytail: a trimmed copy of `jj log`'s graph loop (no prioritized branches,
+// elided nodes, patches or paths); share it with cmd_log if this grows.
+async fn cmd_submodule_log(
+    ui: &mut Ui,
+    command: &CommandHelper,
+    args: &SubmoduleLogArgs,
+) -> Result<(), CommandError> {
+    let workspace_command = command.workspace_helper(ui).await?;
+    let settings = workspace_command.settings();
+    let repo = workspace_command.repo().clone();
+    let sub_repo = load_submodule(&repo, &args.name).await?;
+    let revision = match &args.revisions {
+        Some(revision) => revision.clone(),
+        None => {
+            let gitlink = match workspace_command.get_wc_commit_id() {
+                Some(id) => {
+                    let tree = repo.store().get_commit(id)?.tree();
+                    let submodules = git_submodule::read_gitmodules(repo.store(), &tree).await?;
+                    git_submodule::submodule_gitlinks(&tree, &submodules)
+                        .await?
+                        .remove(&args.name)
+                }
+                None => None,
+            };
+            let heads = match gitlink {
+                Some(id) => format!("present({}) | remote_bookmarks()", id.hex()),
+                None => "remote_bookmarks()".to_owned(),
+            };
+            RevisionArg::from(format!("ancestors({heads}, 10)"))
+        }
+    };
+    // Parsed with the superproject's aliases, resolved in the submodule repo.
+    let expression = workspace_command
+        .parse_revset(ui, &revision)?
+        .expression()
+        .clone();
+    let id_prefix_context = IdPrefixContext::default();
+    let evaluator = RevsetExpressionEvaluator::new(
+        sub_repo.as_ref(),
+        command.revset_extensions().clone(),
+        &id_prefix_context,
+        expression,
+    );
+    let revset = evaluator.evaluate()?;
+
+    // Submodules are read-only, and the superproject's immutable_heads()
+    // likely names bookmarks the submodule doesn't have.
+    let language = workspace_command
+        .env()
+        .commit_template_language_with_immutable(
+            sub_repo.as_ref(),
+            &id_prefix_context,
+            RevsetExpression::all(),
+        );
+    let template_string = match &args.template {
+        Some(value) => value.clone(),
+        None => settings.get_string("templates.log")?,
+    };
+    let template = workspace_command
+        .parse_template(ui, &language, &template_string)?
+        .labeled(["log", "commit"]);
+    let node_template = workspace_command
+        .parse_template(ui, &language, &settings.get_string("templates.log_node")?)?
+        .labeled(["log", "commit", "node"]);
+    let graph_style = GraphStyle::from_settings(settings)?;
+    let with_content_format = LogContentFormat::new(ui, settings)?;
+
+    ui.request_pager();
+    let mut formatter = ui.stdout_formatter();
+    let mut raw_output = formatter.raw()?;
+    let mut graph = get_graphlog(graph_style, raw_output.as_mut());
+    let mut stream = revset.stream_graph().take(args.limit.unwrap_or(usize::MAX));
+    while let Some((commit_id, edges)) = stream.try_next().await? {
+        let edges = edges
+            .into_iter()
+            .map(|edge| match edge.edge_type {
+                GraphEdgeType::Missing => GraphEdge::missing(edge.target),
+                GraphEdgeType::Direct => GraphEdge::direct(edge.target),
+                GraphEdgeType::Indirect => GraphEdge::indirect(edge.target),
+            })
+            .collect_vec();
+        let commit = sub_repo.store().get_commit_async(&commit_id).await?;
+        let mut buffer = vec![];
+        let within_graph = with_content_format.sub_width(graph.width(&commit_id, &edges));
+        within_graph
+            .write(ui.new_formatter(&mut buffer).as_mut(), async |formatter| {
+                template.format(&commit, formatter)
+            })
+            .await?;
+        let node_symbol = format_template(ui, &Some(commit), &node_template);
+        graph.add_node(
+            &commit_id,
+            &edges,
+            &node_symbol,
+            &String::from_utf8_lossy(&buffer),
+        )?;
+    }
+    Ok(())
 }
 
 async fn cmd_submodule_print_gitmodules(

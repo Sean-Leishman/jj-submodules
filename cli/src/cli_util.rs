@@ -1282,13 +1282,29 @@ impl WorkspaceCommandEnvironment {
         repo: &'a dyn Repo,
         id_prefix_context: &'a IdPrefixContext,
     ) -> CommitTemplateLanguage<'a> {
+        self.commit_template_language_with_immutable(
+            repo,
+            id_prefix_context,
+            self.immutable_expression(),
+        )
+    }
+
+    /// Like [`Self::commit_template_language()`], but with the given
+    /// expression for the `immutable` keyword, e.g. for a repo the
+    /// `immutable_heads()` alias doesn't apply to.
+    pub fn commit_template_language_with_immutable<'a>(
+        &'a self,
+        repo: &'a dyn Repo,
+        id_prefix_context: &'a IdPrefixContext,
+        immutable_expression: Arc<UserRevsetExpression>,
+    ) -> CommitTemplateLanguage<'a> {
         CommitTemplateLanguage::new(
             repo,
             &self.path_converter,
             &self.workspace_name,
             self.revset_parse_context(),
             id_prefix_context,
-            self.immutable_expression(),
+            immutable_expression,
             self.conflict_marker_style,
             &self.command.data.commit_template_extensions,
         )

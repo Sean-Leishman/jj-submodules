@@ -180,10 +180,13 @@ implemented in Phase 1:
   still missing are fetched by hash, which the remote may refuse. Relative
   `.gitmodules` URLs resolve against the superproject's `origin`, and URL
   changes in the working-copy commit's `.gitmodules` are followed on fetch.
-- Manual management: `jj git submodule clone|fetch|list|delete|populate|set`
+- Manual management: `jj git submodule clone|fetch|list|log|delete|populate|set`
   (hidden while experimental). `set` points a gitlink at a commit already in
   the submodule store, given as a revset parsed in the superproject and
   resolved in the submodule repo; it also resolves a conflicted gitlink.
+  `log` shows submodule history with the superproject's templates; everything
+  in a submodule counts as immutable, since the superproject's
+  `immutable_heads()` names bookmarks the submodule doesn't have.
 - `jj status` lists submodules that aren't cloned, whose commit isn't fetched,
   or that have local changes.
 

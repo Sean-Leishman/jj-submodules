@@ -186,8 +186,9 @@ and this project adheres to
   fetches them (see `git.clone-submodules` and `git.fetch-submodules`), after
   which checking out a commit populates their directories with the gitlinked
   commit's files. `jj git submodule clone|fetch|list|delete|populate` manage
-  the submodule store, and `jj git submodule set` points a gitlink at another
-  submodule commit (also resolving a conflicted gitlink). Submodules that
+  the submodule store, `jj git submodule log` shows a submodule's history, and
+  `jj git submodule set` points a gitlink at another submodule commit (also
+  resolving a conflicted gitlink). Submodules that
   aren't cloned (or whose commit isn't fetched) are left as empty directories
   with a warning, and `jj status` lists them. Changes inside a submodule
   directory are still not snapshotted, but a submodule with local changes is

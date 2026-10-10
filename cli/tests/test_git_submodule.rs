@@ -677,3 +677,60 @@ fn test_git_submodule_set() {
     ");
     assert_eq!(std::fs::read_to_string(&sub_file).unwrap(), "next\n");
 }
+
+#[test]
+fn test_git_submodule_log() {
+    let test_env = TestEnvironment::default();
+    set_up_superproject(&test_env);
+    let submodule_dir = test_env.work_dir("submodule");
+    submodule_dir.write_file("sub", "next\n");
+    submodule_dir.run_jj(["commit", "-m", "Next"]).success();
+    submodule_dir
+        .run_jj(["bookmark", "create", "-r", "@-", "next"])
+        .success();
+    // A clone sets trunk() to master@origin, which the submodule doesn't have.
+    test_env
+        .run_jj_in(
+            ".",
+            [
+                "git",
+                "clone",
+                &format!("{}/repo", test_env.env_root().display()),
+                "clone",
+            ],
+        )
+        .success();
+    let clone_dir = test_env.work_dir("clone");
+
+    let output = clone_dir.run_jj(["git", "submodule", "log", "sub"]);
+    insta::assert_snapshot!(output, @"
+    ◆  rlvkpnrz test.user@example.com 2001-02-03 08:05:13 next@origin 798c2409
+    │  Next
+    ◆  qpvuntsm test.user@example.com 2001-02-03 08:05:08 main@origin faca8698
+    │  Submodule commit
+    ◆  zzzzzzzz root() 00000000
+    [EOF]
+    ");
+    let output = clone_dir.run_jj([
+        "git",
+        "submodule",
+        "log",
+        "sub",
+        "-r",
+        "::main@origin",
+        "-T",
+        "description",
+    ]);
+    insta::assert_snapshot!(output, @"
+    ◆  Submodule commit
+    ◆
+    [EOF]
+    ");
+    let output = clone_dir.run_jj(["git", "submodule", "log", "nope"]);
+    insta::assert_snapshot!(output, @r#"
+    ------- stderr -------
+    Error: Submodule "nope" is not in the submodule store
+    [EOF]
+    [exit status: 1]
+    "#);
+}
