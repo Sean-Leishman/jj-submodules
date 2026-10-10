@@ -565,3 +565,115 @@ fn test_git_submodule_relative_and_changed_url() {
     [EOF]
     "#);
 }
+
+#[test]
+fn test_git_submodule_set() {
+    let test_env = TestEnvironment::default();
+    let work_dir = set_up_superproject(&test_env);
+    let submodule_dir = test_env.work_dir("submodule");
+    let sub_file = work_dir.root().join("sub").join("sub");
+
+    let output = work_dir.run_jj(["git", "submodule", "set", "sub", "main"]);
+    insta::assert_snapshot!(output, @r#"
+    ------- stderr -------
+    Done importing changes from the underlying Git repo.
+    Error: Submodule "sub" is not in the submodule store
+    [EOF]
+    [exit status: 1]
+    "#);
+
+    work_dir
+        .run_jj(["git", "submodule", "clone", "sub"])
+        .success();
+    submodule_dir.write_file("sub", "next\n");
+    submodule_dir.run_jj(["commit", "-m", "Next"]).success();
+    submodule_dir
+        .run_jj(["bookmark", "create", "-r", "@-", "next"])
+        .success();
+    submodule_dir.run_jj(["new", "main"]).success();
+    submodule_dir.write_file("sub", "alt\n");
+    submodule_dir.run_jj(["commit", "-m", "Alt"]).success();
+    submodule_dir
+        .run_jj(["bookmark", "create", "-r", "@-", "alt"])
+        .success();
+    work_dir.run_jj(["git", "submodule", "fetch"]).success();
+
+    let output = work_dir.run_jj(["git", "submodule", "set", "nope", "next"]);
+    insta::assert_snapshot!(output, @r#"
+    ------- stderr -------
+    Error: Submodule "nope" is not declared in .gitmodules
+    [EOF]
+    [exit status: 1]
+    "#);
+    let output = work_dir.run_jj(["git", "submodule", "set", "sub", "all()"]);
+    insta::assert_snapshot!(output, @r#"
+    ------- stderr -------
+    Error: Revset "all()" must resolve to exactly one commit in submodule "sub"
+    [EOF]
+    [exit status: 1]
+    "#);
+
+    // Moves the gitlink in @ and repopulates the submodule.
+    // Submodule repos have no local bookmarks, only remote ones.
+    let output = work_dir.run_jj(["git", "submodule", "set", "sub", "next"]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Error: Revision `next` doesn't exist
+    Hint: Did you mean `next@origin`?
+    [EOF]
+    [exit status: 1]
+    ");
+    let output = work_dir.run_jj(["git", "submodule", "set", "sub", "next@origin"]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Working copy  (@) now at: 
+    Parent commit (@-)      : Add submodule
+    Added 0 files, modified 2 files, removed 0 files
+    [EOF]
+    ");
+    assert_eq!(std::fs::read_to_string(&sub_file).unwrap(), "next\n");
+    let output = work_dir.run_jj(["diff", "--summary"]);
+    insta::assert_snapshot!(output, @"
+    M sub
+    [EOF]
+    ");
+
+    // Resolves a conflicted gitlink.
+    work_dir
+        .run_jj(["bookmark", "create", "-r", "@", "a"])
+        .success();
+    work_dir.run_jj(["new", "@-"]).success();
+    work_dir
+        .run_jj(["git", "submodule", "set", "sub", "alt@origin"])
+        .success();
+    work_dir.run_jj(["new", "a", "@"]).success();
+    let output = work_dir.run_jj(["status"]);
+    insta::assert_snapshot!(output, @"
+    The working copy has no changes.
+    Working copy  (@) : 
+    Parent commit (@-): 
+    Parent commit (@-): 
+    Warning: There are unresolved conflicts at these paths:
+    sub    2-sided conflict including a git submodule
+    [EOF]
+    ");
+    let output = work_dir.run_jj(["git", "submodule", "set", "sub", "next@origin"]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Working copy  (@) now at: 
+    Parent commit (@-)      : 
+    Parent commit (@-)      : 
+    Added 1 files, modified 1 files, removed 0 files
+    [EOF]
+    ");
+    let output = work_dir.run_jj(["status"]);
+    insta::assert_snapshot!(output, @"
+    Working copy changes:
+    M sub
+    Working copy  (@) : 
+    Parent commit (@-): 
+    Parent commit (@-): 
+    [EOF]
+    ");
+    assert_eq!(std::fs::read_to_string(&sub_file).unwrap(), "next\n");
+}

@@ -163,3 +163,23 @@ loading anything), load stores lazily, and run nested snapshots in parallel.
   clears it.
 - A/B trick without two builds: `touch` every submodule dir forces the full
   path in the same binary.
+
+### 2026-10-10 — back to the Phase 1 plan; `jj git submodule set`
+
+- Checked against docs/design/git-submodules.md: Phase 1 outcomes still open
+  were "update gitlink to an existing submodule commit", "resolve gitlink
+  conflicts", "view submodule history". The status/perf work was drift.
+  Design-doc "Design" sections are our decisions, not maintainer-approved.
+- Known deviation from git-submodule-storage.md ("commands only interact with
+  the submodule repo as an entire unit, never its commit backend directly"):
+  the nested working copy reads the submodule store directly. Raise upstream.
+- Dropped: lazy repo loading in `jj status` (~36 ms on bat; not on the plan).
+- `jj git submodule set <name> <SUBMODULE_REVSET> [-r REV]`: revset parsed in
+  the superproject (its aliases), resolved+evaluated in the submodule repo
+  (same trick as `jj op diff`), must be exactly one commit. Rewrites the
+  gitlink with MergedTreeBuilder; normal checkout repopulates. Writing a plain
+  value also resolves a conflicted gitlink, covering that outcome from the CLI.
+- UX wart: submodule repos have no local bookmarks (fetch auto-tracks
+  nothing), so it's `next@origin`, not `next`. The error hint says so.
+- Fixed stale design-doc line (auto clone/fetch) and CHANGELOG entry.
+- Next Phase 1 item: view submodule history from the superproject.

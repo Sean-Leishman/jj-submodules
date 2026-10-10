@@ -174,9 +174,18 @@ implemented in Phase 1:
   working-copy commit shows the submodule as modified relative to its parent,
   the way `git status` reports a dirty submodule. Once the changes are undone
   the submodule is managed again.
-- Manual management: `jj git submodule clone|fetch|list|delete|populate`
-  (hidden while experimental). Automatic cloning on `jj git clone` and
-  fetching on `jj git fetch` are not implemented yet.
+- `jj git clone` clones the submodules of the checked-out commit and
+  `jj git fetch` fetches cloned ones (best effort; `git.clone-submodules`,
+  `git.fetch-submodules`). After branches and tags, gitlinked commits that are
+  still missing are fetched by hash, which the remote may refuse. Relative
+  `.gitmodules` URLs resolve against the superproject's `origin`, and URL
+  changes in the working-copy commit's `.gitmodules` are followed on fetch.
+- Manual management: `jj git submodule clone|fetch|list|delete|populate|set`
+  (hidden while experimental). `set` points a gitlink at a commit already in
+  the submodule store, given as a revset parsed in the superproject and
+  resolved in the submodule repo; it also resolves a conflicted gitlink.
+- `jj status` lists submodules that aren't cloned, whose commit isn't fetched,
+  or that have local changes.
 
 ### Snapshotting new submodule changes
 

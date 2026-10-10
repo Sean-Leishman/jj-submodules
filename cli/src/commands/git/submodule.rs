@@ -15,8 +15,12 @@
 use std::collections::HashMap;
 use std::io::Write as _;
 
+use futures::StreamExt as _;
+use futures::TryStreamExt as _;
+
 use clap::Subcommand;
 use jj_lib::backend::CommitId;
+use jj_lib::backend::TreeValue;
 use jj_lib::commit::Commit;
 use jj_lib::git;
 use jj_lib::git::get_git_backend;
@@ -24,6 +28,8 @@ use jj_lib::git::get_git_repo;
 use jj_lib::git_submodule;
 use jj_lib::git_submodule::GitSubmoduleError;
 use jj_lib::git_submodule::SubmoduleConfig;
+use jj_lib::id_prefix::IdPrefixContext;
+use jj_lib::merged_tree_builder::MergedTreeBuilder;
 use jj_lib::object_id::ObjectId as _;
 use jj_lib::repo::ReadonlyRepo;
 use jj_lib::repo::Repo as _;
@@ -38,6 +44,7 @@ use crate::command_error::internal_error_with_message;
 use crate::command_error::user_error;
 use crate::git_util::GitSubprocessUi;
 use crate::git_util::print_git_import_stats_summary;
+use crate::revset_util::RevsetExpressionEvaluator;
 use crate::ui::Ui;
 
 /// EXPERIMENTAL: Manage the Git submodules of this repo
@@ -55,6 +62,7 @@ pub enum GitSubmoduleCommand {
     List(SubmoduleListArgs),
     Populate(SubmodulePopulateArgs),
     PrintGitmodules(SubmodulePrintGitmodulesArgs),
+    Set(SubmoduleSetArgs),
 }
 
 /// Clone submodules listed in `.gitmodules` into the submodule store
@@ -94,8 +102,7 @@ pub struct SubmoduleListArgs {}
 ///
 /// Fills the directory of every submodule of the working-copy commit whose
 /// repo and commit are in the submodule store. Runs automatically on checkout
-/// and after `jj git submodule clone`; use this after `jj git submodule fetch`
-/// brought in a commit the working copy was waiting for.
+/// and after `jj git submodule clone` and `fetch`.
 #[derive(clap::Args, Clone, Debug)]
 pub struct SubmodulePopulateArgs {}
 
@@ -103,6 +110,23 @@ pub struct SubmodulePopulateArgs {}
 #[derive(clap::Args, Clone, Debug)]
 pub struct SubmodulePrintGitmodulesArgs {
     /// Read `.gitmodules` from this revision
+    #[arg(long, short = 'r', default_value = "@", value_name = "REVSET")]
+    revision: RevisionArg,
+}
+
+/// Point a submodule's gitlink at a commit of the submodule
+///
+/// Rewrites the superproject commit so the submodule's path refers to the
+/// given submodule commit, which must already be in the submodule store. This
+/// also resolves a conflicted gitlink.
+#[derive(clap::Args, Clone, Debug)]
+pub struct SubmoduleSetArgs {
+    /// Name of the submodule
+    name: String,
+    /// Revision in the submodule repo to point at
+    #[arg(value_name = "SUBMODULE_REVSET")]
+    submodule_revision: RevisionArg,
+    /// The superproject revision to rewrite
     #[arg(long, short = 'r', default_value = "@", value_name = "REVSET")]
     revision: RevisionArg,
 }
@@ -118,6 +142,7 @@ pub async fn cmd_git_submodule(
         GitSubmoduleCommand::Fetch(args) => cmd_submodule_fetch(ui, command, args).await,
         GitSubmoduleCommand::List(args) => cmd_submodule_list(ui, command, args).await,
         GitSubmoduleCommand::Populate(args) => cmd_submodule_populate(ui, command, args).await,
+        GitSubmoduleCommand::Set(args) => cmd_submodule_set(ui, command, args).await,
         GitSubmoduleCommand::PrintGitmodules(args) => {
             cmd_submodule_print_gitmodules(ui, command, args).await
         }
@@ -460,6 +485,77 @@ async fn cmd_submodule_list(
         }
     }
     Ok(())
+}
+
+async fn cmd_submodule_set(
+    ui: &mut Ui,
+    command: &CommandHelper,
+    args: &SubmoduleSetArgs,
+) -> Result<(), CommandError> {
+    let mut workspace_command = command.workspace_helper(ui).await?;
+    let commit = workspace_command
+        .resolve_single_rev(ui, &args.revision)
+        .await?;
+    workspace_command.check_rewritable([commit.id()]).await?;
+    let repo = workspace_command.repo().clone();
+    let submodules = git_submodule::read_gitmodules(repo.store(), &commit.tree()).await?;
+    let Some(config) = submodules.get(&args.name) else {
+        return Err(user_error(format!(
+            "Submodule {:?} is not declared in .gitmodules",
+            args.name
+        )));
+    };
+    let Some(loader) = repo.submodule_store().load_repo(&args.name)? else {
+        return Err(GitSubmoduleError::NotCloned(args.name.clone()).into());
+    };
+    let sub_repo = loader.load_at_head().await?;
+    // Parsed with the superproject's aliases, resolved in the submodule repo.
+    let expression = workspace_command
+        .parse_revset(ui, &args.submodule_revision)?
+        .expression()
+        .clone();
+    let id_prefix_context = IdPrefixContext::default();
+    let evaluator = RevsetExpressionEvaluator::new(
+        sub_repo.as_ref(),
+        command.revset_extensions().clone(),
+        &id_prefix_context,
+        expression,
+    );
+    let ids: Vec<CommitId> = evaluator
+        .evaluate_to_commit_ids()?
+        .take(2)
+        .try_collect()
+        .await?;
+    let [sub_commit_id] = ids.as_slice() else {
+        return Err(user_error(format!(
+            "Revset {:?} must resolve to exactly one commit in submodule {:?}",
+            args.submodule_revision.as_ref(),
+            args.name
+        )));
+    };
+
+    let mut tx = workspace_command.start_transaction();
+    let mut tree_builder = MergedTreeBuilder::new(commit.tree());
+    tree_builder.set_or_remove(
+        config.path.clone(),
+        Some(TreeValue::GitSubmodule(sub_commit_id.clone())),
+    );
+    let new_tree = tree_builder.write_tree().await?;
+    tx.repo_mut()
+        .rewrite_commit(&commit)
+        .set_tree(new_tree)
+        .write()
+        .await?;
+    tx.finish(
+        ui,
+        format!(
+            "set submodule {} to {} in commit {}",
+            args.name,
+            sub_commit_id.hex(),
+            commit.id().hex()
+        ),
+    )
+    .await
 }
 
 async fn cmd_submodule_print_gitmodules(

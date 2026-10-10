@@ -181,14 +181,17 @@ and this project adheres to
 * The hunk headers of `diff.color-words.conflict = "pair"` now include the
   conflict labels of the compared terms.
 
-* Experimental read-only Git submodule support. `jj git submodule clone --all`
-  clones the submodules declared in `.gitmodules` into the jj repo, after which
-  checking out a commit populates their directories with the gitlinked
-  commit's files. `jj git submodule fetch|list|delete|populate` manage the
-  submodule store. Submodules that aren't cloned (or whose commit isn't
-  fetched) are left as empty directories with a warning. Changes inside a
-  submodule directory are still not snapshotted, but a submodule with local
-  changes is never overwritten or removed by a checkout.
+* Experimental read-only Git submodule support. `jj git clone` clones the
+  submodules declared in `.gitmodules` into the jj repo and `jj git fetch`
+  fetches them (see `git.clone-submodules` and `git.fetch-submodules`), after
+  which checking out a commit populates their directories with the gitlinked
+  commit's files. `jj git submodule clone|fetch|list|delete|populate` manage
+  the submodule store, and `jj git submodule set` points a gitlink at another
+  submodule commit (also resolving a conflicted gitlink). Submodules that
+  aren't cloned (or whose commit isn't fetched) are left as empty directories
+  with a warning, and `jj status` lists them. Changes inside a submodule
+  directory are still not snapshotted, but a submodule with local changes is
+  never overwritten or removed by a checkout.
   [#494](https://github.com/jj-vcs/jj/issues/494)
 
 ### Fixed bugs
