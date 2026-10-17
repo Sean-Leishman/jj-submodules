@@ -37,6 +37,7 @@ use jj_lib::merged_tree_builder::MergedTreeBuilder;
 use jj_lib::object_id::ObjectId as _;
 use jj_lib::repo::ReadonlyRepo;
 use jj_lib::repo::Repo as _;
+use jj_lib::repo_path::RepoPath;
 use jj_lib::repo_path::RepoPathBuf;
 use jj_lib::revset::RevsetExpression;
 
@@ -480,11 +481,22 @@ pub(crate) async fn submodule_status(
         };
         let problem = match repo.submodule_store().load_repo(name)? {
             None => format!("not cloned; run `jj git submodule clone {name}`"),
-            Some(loader) if loader.store().get_commit(gitlink).is_err() => format!(
-                "commit {} not fetched; run `jj git submodule fetch {name}`",
-                gitlink.hex()
-            ),
-            Some(_) => continue,
+            Some(loader) => match loader.store().get_commit(gitlink) {
+                Err(_) => format!(
+                    "commit {} not fetched; run `jj git submodule fetch {name}`",
+                    gitlink.hex()
+                ),
+                Ok(commit)
+                    if commit
+                        .tree()
+                        .path_value(RepoPath::from_internal_string(".gitmodules").unwrap())
+                        .await?
+                        .is_present() =>
+                {
+                    "has submodules of its own, which jj doesn't populate yet".to_owned()
+                }
+                Ok(_) => continue,
+            },
         };
         problems.push((config.path.clone(), problem));
     }

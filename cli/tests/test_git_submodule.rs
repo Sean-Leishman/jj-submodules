@@ -1001,3 +1001,61 @@ fn test_git_submodule_unfetchable_gitlink() {
     [EOF]
     "#);
 }
+
+#[test]
+fn test_git_submodule_nested() {
+    let test_env = TestEnvironment::default();
+    let work_dir = set_up_superproject(&test_env);
+    let submodule_dir = test_env.work_dir("submodule");
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "inner"])
+        .success();
+    let inner_dir = test_env.work_dir("inner");
+    inner_dir.write_file("inner", "inner\n");
+    inner_dir.run_jj(["commit", "-m", "Inner"]).success();
+    // Give the submodule a submodule of its own.
+    submodule_dir
+        .run_jj([
+            "util",
+            "exec",
+            "--",
+            "sh",
+            "-c",
+            &format!(
+                "git -c protocol.file.allow=always submodule add -q {}/inner inner && git -c \
+                 user.email=test@example.com -c user.name='Test user' commit -qm 'Add inner'",
+                test_env.env_root().display()
+            ),
+        ])
+        .success();
+    submodule_dir
+        .run_jj(["bookmark", "create", "-r", "@-", "nested"])
+        .success();
+    work_dir
+        .run_jj(["git", "submodule", "clone", "sub"])
+        .success();
+
+    // The submodule is populated; its own submodule stays empty, with a
+    // warning rather than silently.
+    let output = work_dir.run_jj(["git", "submodule", "set", "sub", "nested@origin"]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Working copy  (@) now at: 
+    Parent commit (@-)      : Add submodule
+    Added 2 files, modified 1 files, removed 0 files
+    Warning: Submodule at sub: it has submodules of its own, which jj doesn't populate yet
+    [EOF]
+    ");
+    assert!(work_dir.root().join("sub/.gitmodules").exists());
+    assert!(!work_dir.root().join("sub/inner/inner").exists());
+    let output = work_dir.run_jj(["status"]);
+    insta::assert_snapshot!(output, @"
+    Working copy changes:
+    M sub
+    Submodules:
+      sub: has submodules of its own, which jj doesn't populate yet
+    Working copy  (@) : 
+    Parent commit (@-): Add submodule
+    [EOF]
+    ");
+}

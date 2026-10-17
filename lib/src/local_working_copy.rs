@@ -3116,6 +3116,8 @@ fn nested_maybe_dirty(state_path: &Path, dir: &Path) -> bool {
 #[cfg(feature = "git")]
 const DIRTY_SUBMODULE: &str =
     "it has local changes, which jj cannot snapshot yet; the directory was left as is";
+#[cfg(feature = "git")]
+const NESTED_SUBMODULES: &str = "it has submodules of its own, which jj doesn't populate yet";
 
 /// Populating submodule directories: each populated submodule gets its own
 /// [`TreeState`] backed by the submodule repo's store, rooted at the
@@ -3303,7 +3305,18 @@ impl LockedLocalWorkingCopy {
         if was_populated && nested_is_dirty(&mut state)? {
             return Ok(Err(DIRTY_SUBMODULE.to_owned()));
         }
-        let sub_stats = state.check_out(&new_tree)?;
+        let mut sub_stats = state.check_out(&new_tree)?;
+        // ponytail: nested submodules stay empty; populating them needs a
+        // submodule store per submodule repo.
+        if state
+            .file_states()
+            .iter()
+            .any(|(_, file_state)| file_state.file_type == FileType::GitSubmodule)
+        {
+            sub_stats
+                .skipped_submodules
+                .push((path.to_owned(), NESTED_SUBMODULES.to_owned()));
+        }
         state
             .save()
             .map_err(|err| submodule_state_error("Failed to save submodule state", err))?;
