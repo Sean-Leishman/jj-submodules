@@ -3040,6 +3040,10 @@ async fn gitmodules_by_path(store: &Store, tree: &MergedTree) -> HashMap<RepoPat
 /// snapshotted for real; the tree state isn't saved.
 #[cfg(feature = "git")]
 fn nested_is_dirty(state: &mut TreeState) -> Result<bool, CheckoutError> {
+    // Replaced by a file or deleted: a local change, nothing to snapshot.
+    if !state.working_copy_path().is_dir() {
+        return Ok(true);
+    }
     let options = SnapshotOptions {
         base_ignores: GitIgnoreFile::empty(),
         progress: None,
@@ -3118,6 +3122,9 @@ const DIRTY_SUBMODULE: &str =
     "it has local changes, which jj cannot snapshot yet; the directory was left as is";
 #[cfg(feature = "git")]
 const NESTED_SUBMODULES: &str = "it has submodules of its own, which jj doesn't populate yet";
+#[cfg(feature = "git")]
+const IGNORED_LEFTOVERS: &str =
+    "it still has ignored files, which jj doesn't delete; the directory was left as is";
 
 /// Populating submodule directories: each populated submodule gets its own
 /// [`TreeState`] backed by the submodule repo's store, rooted at the
@@ -3181,16 +3188,25 @@ impl LockedLocalWorkingCopy {
                 continue;
             }
             let Some(name) = old_map.get(&path).or(new_name) else {
+                // Can't tell clean from dirty without a repo; keep the gitlink
+                // so the files are neither deleted nor snapshotted.
                 stats.skipped_submodules.push((
-                    path,
+                    path.clone(),
                     "not in .gitmodules; its populated files were left in place".to_owned(),
                 ));
+                kept.push((path, old_value));
                 continue;
             };
             let Some((sub_store, mut state)) = self.load_nested(&path, name, stats)? else {
                 continue;
             };
             if nested_is_dirty(&mut state)? {
+                if stays {
+                    // The gitlink moves but the directory can't follow; the
+                    // populate pass reports it. The commit keeps the new
+                    // gitlink, as with Git.
+                    continue;
+                }
                 stats
                     .skipped_submodules
                     .push((path.clone(), DIRTY_SUBMODULE.to_owned()));
@@ -3199,6 +3215,19 @@ impl LockedLocalWorkingCopy {
             }
             if !stays {
                 add_checkout_stats(stats, state.check_out(&sub_store.empty_merged_tree())?);
+                let disk_dir = path.to_fs_path(&self.wc.working_copy_path)?;
+                if fs::read_dir(&disk_dir).is_ok_and(|mut entries| entries.next().is_some()) {
+                    // Ignored files remain; keep the gitlink so the superproject
+                    // doesn't snapshot them as its own.
+                    state.save().map_err(|err| {
+                        submodule_state_error("Failed to save submodule state", err)
+                    })?;
+                    stats
+                        .skipped_submodules
+                        .push((path.clone(), IGNORED_LEFTOVERS.to_owned()));
+                    kept.push((path, old_value));
+                    continue;
+                }
                 let state_path = self.submodule_state_path(&path);
                 fs::remove_dir_all(&state_path).map_err(|err| {
                     submodule_state_error("Failed to remove submodule state directory", err)
@@ -3208,8 +3237,8 @@ impl LockedLocalWorkingCopy {
         Ok(kept)
     }
 
-    /// Loads the populated submodule's store and tree state; `None` (with a
-    /// warning) if its repo is no longer in the submodule store.
+    /// Loads the populated submodule's store and tree state; `None` if it was
+    /// cleared, or (with a warning) if its repo is no longer in the store.
     fn load_nested(
         &self,
         path: &RepoPath,
@@ -3233,6 +3262,11 @@ impl LockedLocalWorkingCopy {
         };
         let store = loader.store().clone();
         let state = self.nested_tree_state(store.clone(), path)?;
+        if state.file_states().is_empty() {
+            // Cleared, only ignored files left: nothing to protect or remove,
+            // the populate pass treats it as new.
+            return Ok(None);
+        }
         Ok(Some((store, state)))
     }
 
@@ -3293,11 +3327,19 @@ impl LockedLocalWorkingCopy {
             Err(err) => return Err(err.into()),
         };
         let disk_path = path.to_fs_path(&self.wc.working_copy_path)?;
+        let state_path = self.submodule_state_path(path);
+        if !disk_path.exists() && state_path.exists() {
+            // Deleted by the user: nothing left to clobber, populate afresh.
+            fs::remove_dir_all(&state_path).map_err(|err| {
+                submodule_state_error("Failed to remove submodule state directory", err)
+            })?;
+        }
         if let Err(err) = fs::create_dir_all(&disk_path) {
             return Ok(Err(format!("its directory could not be created: {err}")));
         }
-        let was_populated = self.submodule_state_path(path).join("tree_state").exists();
         let mut state = self.nested_tree_state(store, path)?;
+        // Cleared (only ignored files left) counts as not populated.
+        let was_populated = !state.file_states().is_empty();
         let new_tree = commit.tree();
         if state.current_tree().tree_ids_and_labels() == new_tree.tree_ids_and_labels() {
             return Ok(Ok(CheckoutStats::default()));
@@ -3502,18 +3544,31 @@ impl LockedWorkingCopy for LockedLocalWorkingCopy {
         let new_matcher = PrefixMatcher::new(&new_sparse_patterns);
         let mut stats = CheckoutStats::default();
         #[cfg(feature = "git")]
-        if let Some((path, _)) = self
-            .prepare_submodules(&tree, &tree, &new_matcher, &mut stats)
-            .await?
-            .first()
         {
-            return Err(submodule_state_error(
-                &format!(
-                    "Submodule at {} has local changes; commit or discard them first",
-                    path.as_internal_file_string()
-                ),
-                "cannot change sparse patterns over a modified submodule",
-            ));
+            // Refuse before clearing anything, so nothing is half done.
+            let names = gitmodules_by_path(&self.wc.store.clone(), &tree).await;
+            for path in self.populated_submodule_paths() {
+                if new_matcher.matches(&path) {
+                    continue;
+                }
+                let Some(name) = names.get(&path) else {
+                    continue;
+                };
+                let Some((_, mut state)) = self.load_nested(&path, name, &mut stats)? else {
+                    continue;
+                };
+                if nested_is_dirty(&mut state)? {
+                    return Err(submodule_state_error(
+                        &format!(
+                            "Submodule at {} has local changes; commit or discard them first",
+                            path.as_internal_file_string()
+                        ),
+                        "cannot change sparse patterns over a modified submodule",
+                    ));
+                }
+            }
+            self.prepare_submodules(&tree, &tree, &new_matcher, &mut stats)
+                .await?;
         }
         add_checkout_stats(
             &mut stats,

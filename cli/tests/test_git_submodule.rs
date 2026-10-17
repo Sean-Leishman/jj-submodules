@@ -469,6 +469,21 @@ fn test_git_submodule_auto_clone_and_fetch() {
     Added 1 files, modified 1 files, removed 0 files
     [EOF]
     ");
+    // Fetching must not need the working copy.
+    let output = clone_dir.run_jj(["git", "fetch", "--ignore-working-copy"]);
+    insta::assert_snapshot!(output, @r#"
+    ------- stderr -------
+    Fetching from Git remotes: origin
+    Nothing changed.
+    Fetching submodule "sub"
+    [EOF]
+    "#);
+    let output = clone_dir.run_jj(["git", "submodule", "fetch", "--ignore-working-copy"]);
+    insta::assert_snapshot!(output, @r#"
+    ------- stderr -------
+    Fetching submodule "sub"
+    [EOF]
+    "#);
     assert_eq!(
         std::fs::read_to_string(clone_dir.root().join("sub/detached")).unwrap(),
         "detached\n"
@@ -551,6 +566,35 @@ fn test_git_submodule_relative_and_changed_url() {
     "#);
     let clone_dir = test_env.work_dir("clone");
     assert!(clone_dir.root().join("sub/sub").exists());
+    // Also against a remote not named "origin".
+    let output = test_env.run_jj_in(
+        ".",
+        [
+            "git",
+            "clone",
+            "--remote=upstream",
+            &format!("{}/repo", test_env.env_root().display()),
+            "clone-upstream",
+        ],
+    );
+    insta::assert_snapshot!(output, @r#"
+    ------- stderr -------
+    Fetching into new repo in "$TEST_ENV/clone-upstream"
+    bookmark: master@upstream [new] tracked
+    Setting the revset alias `trunk()` to `master@upstream`.
+    Cloning submodule "sub" from $TEST_ENV/submodule
+    Working copy  (@) now at: 
+    Parent commit (@-)      : relative
+    Added 3 files, modified 0 files, removed 0 files
+    [EOF]
+    "#);
+    assert!(
+        test_env
+            .work_dir("clone-upstream")
+            .root()
+            .join("sub/sub")
+            .exists()
+    );
 
     // The submodule moves; fetch follows the new URL once it's checked out.
     std::fs::rename(
@@ -790,7 +834,9 @@ fn test_git_submodule_undo_workspaces_and_rewrites() {
     [EOF]
     ");
     assert_eq!(std::fs::read_to_string(&sub_file).unwrap(), "sub\n");
-    let output = work_dir.run_jj(["op", "restore", "@-"]).normalize_stderr_with(hide_ids);
+    let output = work_dir
+        .run_jj(["op", "restore", "@-"])
+        .normalize_stderr_with(hide_ids);
     insta::assert_snapshot!(output, @"
     ------- stderr -------
     Restored to operation: [id] (2001-02-03 08:05:19) set submodule sub to [id] in commit [id]
@@ -849,21 +895,21 @@ fn test_git_submodule_undo_workspaces_and_rewrites() {
       
     Working copy  (@) now at: 
     Parent commit (@-)      : Add submodule
+    Added 0 files, modified 1 files, removed 0 files
     Warning: Submodule at sub: it has local changes, which jj cannot snapshot yet; the directory was left as is
     [EOF]
     ");
     assert_eq!(std::fs::read_to_string(&sub_file).unwrap(), "local edit\n");
     let output = work_dir.run_jj(["status"]);
     insta::assert_snapshot!(output, @"
-    Working copy changes:
-    M sub
+    The working copy has no changes.
     Submodules:
       sub: has local changes, which jj does not record yet
     Working copy  (@) : 
     Parent commit (@-): Add submodule
     [EOF]
     ");
-    // That snapshot is stable: later commands don't snapshot again.
+    // Nothing was recorded, and nothing is on later commands either.
     let op_id = || {
         work_dir
             .run_jj(["op", "log", "-n1", "--no-graph", "-T", "id"])
@@ -881,16 +927,6 @@ fn test_git_submodule_undo_workspaces_and_rewrites() {
     Parent commit (@-)      : 
     Added 0 files, modified 0 files, removed 1 files
     Warning: Submodule at sub: it has local changes, which jj cannot snapshot yet; the directory was left as is
-    Warning: There are unresolved conflicts at these paths:
-    sub    2-sided conflict including 1 deletion and a git submodule
-    New conflicts appeared in 1 commits:
-      
-    Hint: To resolve the conflicts, start by creating a commit on top of
-    the conflicted commit:
-      jj new nmzmmopx
-    Then use `jj resolve`, or edit the conflict markers in the file directly.
-    Once the conflicts are resolved, you can inspect the result with `jj diff`.
-    Then run `jj squash` to move the resolution into the conflicted commit.
     [EOF]
     ");
     assert_eq!(std::fs::read_to_string(&sub_file).unwrap(), "local edit\n");
@@ -904,24 +940,19 @@ fn test_git_submodule_undo_workspaces_and_rewrites() {
     Restored to operation: [id] (2001-02-03 08:05:31) rebase commit [id]
     Working copy  (@) now at: 
     Parent commit (@-)      : 
-    Added 0 files, modified 1 files, removed 0 files
-    Warning: 1 of those updates were skipped because there were conflicting changes in the working copy.
-    Hint: Inspect the changes compared to the intended target with `jj diff --from [id]`.
-    Discard the conflicting changes with `jj restore --from [id]`.
     Warning: Submodule at sub: not in .gitmodules; its populated files were left in place
-    Warning: There are unresolved conflicts at these paths:
-    sub    2-sided conflict including 1 deletion and a git submodule
-    New conflicts appeared in 1 commits:
-      
-    Hint: To resolve the conflicts, start by creating a commit on top of
-    the conflicted commit:
-      jj new nmzmmopx
-    Then use `jj resolve`, or edit the conflict markers in the file directly.
-    Once the conflicts are resolved, you can inspect the result with `jj diff`.
-    Then run `jj squash` to move the resolution into the conflicted commit.
     [EOF]
     ");
     assert_eq!(std::fs::read_to_string(&sub_file).unwrap(), "local edit\n");
+    // Its files never become the superproject's.
+    let output = work_dir.run_jj(["status"]);
+    insta::assert_snapshot!(output, @"
+    Working copy changes:
+    A sub
+    Working copy  (@) : 
+    Parent commit (@-): 
+    [EOF]
+    ");
     let output = work_dir.run_jj(["git", "submodule", "delete", "sub"]);
     insta::assert_snapshot!(output, @r#"
     ------- stderr -------
@@ -1056,6 +1087,338 @@ fn test_git_submodule_nested() {
       sub: has submodules of its own, which jj doesn't populate yet
     Working copy  (@) : 
     Parent commit (@-): Add submodule
+    [EOF]
+    ");
+}
+
+#[test]
+fn test_git_submodule_type_changes_and_missing_dir() {
+    let test_env = TestEnvironment::default();
+    let work_dir = set_up_superproject(&test_env);
+    let sub_file = work_dir.root().join("sub").join("sub");
+    // Commits where `sub` is a plain file ("file") and a plain directory
+    // ("dir"), made with git plumbing: the working copy ignores whatever is on
+    // disk at a submodule's path.
+    work_dir
+        .run_jj([
+            "util",
+            "exec",
+            "--",
+            "sh",
+            "-c",
+            "set -e
+            export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
+            gm=$(git rev-parse HEAD:.gitmodules)
+            blob=$(echo f | git hash-object -w --stdin)
+            tree=$(printf '100644 blob %s\t.gitmodules\n100644 blob %s\tsub\n' $gm $blob | git mktree)
+            git update-ref refs/heads/file $(git commit-tree $tree -p HEAD -m file)
+            sub=$(printf '100644 blob %s\tplain\n' $blob | git mktree)
+            tree=$(printf '100644 blob %s\t.gitmodules\n040000 tree %s\tsub\n' $gm $sub | git mktree)
+            git update-ref refs/heads/dir $(git commit-tree $tree -p HEAD -m dir)",
+        ])
+        .success();
+    work_dir
+        .run_jj(["git", "submodule", "clone", "sub"])
+        .success();
+    assert_eq!(std::fs::read_to_string(&sub_file).unwrap(), "sub\n");
+    let state_dir = work_dir.root().join(".jj/working_copy/submodules");
+
+    // Clean submodule: gitlink -> file -> directory -> gitlink.
+    let output = work_dir.run_jj(["new", "file"]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Working copy  (@) now at: 
+    Parent commit (@-)      : file
+    Added 0 files, modified 1 files, removed 1 files
+    [EOF]
+    ");
+    assert_eq!(
+        std::fs::read_to_string(work_dir.root().join("sub")).unwrap(),
+        "f\n"
+    );
+    assert!(std::fs::read_dir(&state_dir).unwrap().next().is_none());
+    let output = work_dir.run_jj(["new", "dir"]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Working copy  (@) now at: 
+    Parent commit (@-)      : dir
+    Added 1 files, modified 0 files, removed 1 files
+    [EOF]
+    ");
+    assert_eq!(
+        std::fs::read_to_string(work_dir.root().join("sub/plain")).unwrap(),
+        "f\n"
+    );
+    let output = work_dir.run_jj(["new", "master"]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Working copy  (@) now at: 
+    Parent commit (@-)      : Add submodule
+    Added 2 files, modified 0 files, removed 1 files
+    [EOF]
+    ");
+    assert_eq!(std::fs::read_to_string(&sub_file).unwrap(), "sub\n");
+    assert!(!work_dir.root().join("sub/plain").exists());
+
+    // Dirty submodule: the gitlink is kept in place of the file or directory.
+    std::fs::write(&sub_file, "edit\n").unwrap();
+    let output = work_dir.run_jj(["new", "file"]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Working copy  (@) now at: 
+    Parent commit (@-)      : file
+    Warning: Submodule at sub: it has local changes, which jj cannot snapshot yet; the directory was left as is
+    [EOF]
+    ");
+    assert_eq!(std::fs::read_to_string(&sub_file).unwrap(), "edit\n");
+    let output = work_dir.run_jj(["status"]);
+    insta::assert_snapshot!(output, @"
+    Working copy changes:
+    M sub
+    Submodules:
+      sub: has local changes, which jj does not record yet
+    Working copy  (@) : 
+    Parent commit (@-): file
+    [EOF]
+    ");
+    let output = work_dir.run_jj(["new", "dir"]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Working copy  (@) now at: 
+    Parent commit (@-)      : dir
+    Warning: Submodule at sub: it has local changes, which jj cannot snapshot yet; the directory was left as is
+    [EOF]
+    ");
+    assert_eq!(std::fs::read_to_string(&sub_file).unwrap(), "edit\n");
+    let output = work_dir.run_jj(["status"]);
+    insta::assert_snapshot!(output, @"
+    Working copy changes:
+    A sub
+    D sub/plain
+    Submodules:
+      sub: has local changes, which jj does not record yet
+    Working copy  (@) : 
+    Parent commit (@-): dir
+    [EOF]
+    ");
+    work_dir.run_jj(["new", "master"]).success();
+    std::fs::write(&sub_file, "sub\n").unwrap();
+
+    // The submodule directory deleted or replaced by a file is a local
+    // change; `populate` restores a deleted one.
+    std::fs::remove_dir_all(work_dir.root().join("sub")).unwrap();
+    let output = work_dir.run_jj(["status"]);
+    insta::assert_snapshot!(output, @"
+    The working copy has no changes.
+    Submodules:
+      sub: has local changes, which jj does not record yet
+    Working copy  (@) : 
+    Parent commit (@-): Add submodule
+    [EOF]
+    ");
+    let output = work_dir.run_jj(["git", "submodule", "populate"]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Added 1 files, modified 0 files, removed 0 files
+    [EOF]
+    ");
+    assert_eq!(std::fs::read_to_string(&sub_file).unwrap(), "sub\n");
+    std::fs::remove_dir_all(work_dir.root().join("sub")).unwrap();
+    work_dir.write_file("sub", "f\n");
+    let output = work_dir.run_jj(["status"]);
+    insta::assert_snapshot!(output, @"
+    The working copy has no changes.
+    Submodules:
+      sub: has local changes, which jj does not record yet
+    Working copy  (@) : 
+    Parent commit (@-): Add submodule
+    [EOF]
+    ");
+    let output = work_dir.run_jj(["git", "submodule", "populate"]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Warning: Submodule at sub: its directory could not be created: File exists (os error 17)
+    [EOF]
+    ");
+    std::fs::remove_file(work_dir.root().join("sub")).unwrap();
+    let output = work_dir.run_jj(["git", "submodule", "populate"]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Added 1 files, modified 0 files, removed 0 files
+    [EOF]
+    ");
+    assert_eq!(std::fs::read_to_string(&sub_file).unwrap(), "sub\n");
+}
+
+#[test]
+fn test_git_submodule_delete_dirty_and_ignored_leftovers() {
+    let test_env = TestEnvironment::default();
+    let work_dir = set_up_superproject(&test_env);
+    let submodule_dir = test_env.work_dir("submodule");
+    let sub_file = work_dir.root().join("sub").join("sub");
+    work_dir
+        .run_jj(["git", "submodule", "clone", "sub"])
+        .success();
+    submodule_dir.write_file(".gitignore", "build/\n");
+    submodule_dir
+        .run_jj(["commit", "-m", "Ignore build"])
+        .success();
+    submodule_dir
+        .run_jj(["bookmark", "create", "-r", "@-", "ignore"])
+        .success();
+    work_dir.run_jj(["git", "submodule", "fetch"]).success();
+    work_dir
+        .run_jj(["git", "submodule", "set", "sub", "ignore@origin"])
+        .success();
+    work_dir
+        .run_jj(["bookmark", "create", "-r", "@", "ign"])
+        .success();
+    // Ignored files inside the submodule don't make it dirty.
+    work_dir.write_file("sub/build/out", "out\n");
+    let output = work_dir.run_jj(["status"]);
+    insta::assert_snapshot!(output, @"
+    Working copy changes:
+    M sub
+    Working copy  (@) : 
+    Parent commit (@-): Add submodule
+    [EOF]
+    ");
+
+    // Deleting the repo of a submodule with local changes is refused.
+    std::fs::write(&sub_file, "edit\n").unwrap();
+    let output = work_dir.run_jj(["git", "submodule", "delete", "sub"]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Error: Submodule at sub: it has local changes, which jj cannot snapshot yet; the directory was left as is
+    Hint: Its repo would be deleted with those changes still unrecorded.
+    [EOF]
+    [exit status: 1]
+    ");
+    let output = work_dir.run_jj(["git", "submodule", "list"]);
+    insta::assert_snapshot!(output, @"
+    sub: sub
+    [EOF]
+    ");
+
+    // A dirty submodule whose gitlink moves stays put, but the commit keeps
+    // the new gitlink: nothing is recorded in the superproject.
+    let output = work_dir.run_jj(["new", "master"]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Working copy  (@) now at: 
+    Parent commit (@-)      : Add submodule
+    Added 0 files, modified 1 files, removed 0 files
+    Warning: Submodule at sub: it has local changes, which jj cannot snapshot yet; the directory was left as is
+    [EOF]
+    ");
+    assert_eq!(std::fs::read_to_string(&sub_file).unwrap(), "edit\n");
+    let output = work_dir.run_jj(["diff", "--summary"]);
+    insta::assert_snapshot!(output, @"");
+    let output = work_dir.run_jj(["status"]);
+    insta::assert_snapshot!(output, @"
+    The working copy has no changes.
+    Submodules:
+      sub: has local changes, which jj does not record yet
+    Working copy  (@) : 
+    Parent commit (@-): Add submodule
+    [EOF]
+    ");
+    work_dir.run_jj(["new", "ign"]).success();
+    std::fs::write(&sub_file, "sub\n").unwrap();
+    let output = work_dir.run_jj(["status"]);
+    insta::assert_snapshot!(output, @"
+    The working copy has no changes.
+    Working copy  (@) : 
+    Parent commit (@-): 
+    [EOF]
+    ");
+
+    // Leaving the submodule removes its tracked files but not ignored ones;
+    // the gitlink is kept so they are never snapshotted as the
+    // superproject's.
+    let output = work_dir.run_jj(["new", "root()"]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Working copy  (@) now at: 
+    Parent commit (@-)      : 
+    Added 0 files, modified 0 files, removed 3 files
+    Warning: Submodule at sub: it still has ignored files, which jj doesn't delete; the directory was left as is
+    [EOF]
+    ");
+    assert!(!sub_file.exists());
+    assert!(work_dir.root().join("sub/build/out").exists());
+    let output = work_dir.run_jj(["status"]);
+    insta::assert_snapshot!(output, @"
+    Working copy changes:
+    A sub
+    Working copy  (@) : 
+    Parent commit (@-): 
+    [EOF]
+    ");
+    // Coming back repopulates around them.
+    let output = work_dir.run_jj(["new", "ign"]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Working copy  (@) now at: 
+    Parent commit (@-)      : 
+    Added 3 files, modified 0 files, removed 0 files
+    [EOF]
+    ");
+    assert_eq!(std::fs::read_to_string(&sub_file).unwrap(), "sub\n");
+    assert!(work_dir.root().join("sub/build/out").exists());
+    let output = work_dir.run_jj(["status"]);
+    insta::assert_snapshot!(output, @"
+    The working copy has no changes.
+    Working copy  (@) : 
+    Parent commit (@-): 
+    [EOF]
+    ");
+}
+
+#[test]
+fn test_git_submodule_bad_gitmodules() {
+    let test_env = TestEnvironment::default();
+    let work_dir = set_up_superproject(&test_env);
+    work_dir.write_file(".gitmodules", "[submodule \"sub\"\n");
+    work_dir
+        .run_jj(["commit", "-m", "Break .gitmodules"])
+        .success();
+    work_dir
+        .run_jj(["bookmark", "set", "master", "-r", "@-"])
+        .success();
+    // Automatic clone and fetch warn and go on.
+    let output = test_env.run_jj_in(
+        ".",
+        [
+            "git",
+            "clone",
+            &format!("{}/repo", test_env.env_root().display()),
+            "clone",
+        ],
+    );
+    insta::assert_snapshot!(output, @r#"
+    ------- stderr -------
+    Fetching into new repo in "$TEST_ENV/clone"
+    bookmark: master@origin [new] tracked
+    Setting the revset alias `trunk()` to `master@origin`.
+    Warning: Not cloning submodules: Failed to parse .gitmodules
+    Working copy  (@) now at: 
+    Parent commit (@-)      : Break .gitmodules
+    Added 2 files, modified 0 files, removed 0 files
+    [EOF]
+    "#);
+    let output = test_env.work_dir("clone").run_jj(["git", "fetch"]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Fetching from Git remotes: origin
+    Nothing changed.
+    [EOF]
+    ");
+    let output = test_env.work_dir("clone").run_jj(["status"]);
+    insta::assert_snapshot!(output, @"
+    The working copy has no changes.
+    Working copy  (@) : 
+    Parent commit (@-): Break .gitmodules
     [EOF]
     ");
 }

@@ -218,7 +218,13 @@ pub(crate) async fn clone_declared_submodules(
     commit: &Commit,
 ) -> Result<(), CommandError> {
     let repo = workspace_command.repo().clone();
-    let submodules = git_submodule::read_gitmodules(repo.store(), &commit.tree()).await?;
+    let submodules = match git_submodule::read_gitmodules(repo.store(), &commit.tree()).await {
+        Ok(submodules) => submodules,
+        Err(err) => {
+            writeln!(ui.warning_default(), "Not cloning submodules: {err}")?;
+            return Ok(());
+        }
+    };
     let gitlinks = git_submodule::submodule_gitlinks(&commit.tree(), &submodules).await?;
     let cloned = repo.submodule_store().list()?;
     for (name, config) in &submodules {
@@ -288,9 +294,19 @@ fn fetch_url(repo: &ReadonlyRepo, remote: &str) -> Option<String> {
 }
 
 /// Resolves a `.gitmodules` URL against the superproject's remote.
-// ponytail: always "origin"; Git prefers the current branch's upstream remote.
+// ponytail: "origin", else the only remote; Git prefers the current branch's
+// upstream remote.
 fn resolve_url(workspace_command: &WorkspaceCommandHelper, url: &str) -> String {
-    let base = fetch_url(workspace_command.repo(), "origin")
+    let repo = workspace_command.repo();
+    let base = fetch_url(repo, "origin")
+        .or_else(|| {
+            let git_repo = get_git_repo(repo.store()).ok()?;
+            let names = git_repo.remote_names();
+            if names.len() != 1 {
+                return None;
+            }
+            fetch_url(repo, &names.iter().next()?.to_string())
+        })
         .unwrap_or_else(|| workspace_command.workspace_root().display().to_string());
     git_submodule::resolve_submodule_url(url, &base)
 }
@@ -299,15 +315,29 @@ pub(crate) async fn populate_submodules(
     ui: &mut Ui,
     workspace_command: &mut WorkspaceCommandHelper,
 ) -> Result<(), CommandError> {
+    // --ignore-working-copy/--at-op: the clone/fetch still happened, the
+    // directories fill in on the next checkout.
+    if workspace_command.check_working_copy_writable().is_err() {
+        return Ok(());
+    }
     let (mut locked_ws, wc_commit) = workspace_command.start_working_copy_mutation().await?;
-    let stats = locked_ws
+    let mut stats = locked_ws
         .locked_wc()
         .populate_submodules()
         .await
         .map_err(|err| internal_error_with_message("Failed to populate submodules", err))?;
     let operation_id = locked_ws.locked_wc().old_operation_id().clone();
     locked_ws.finish(operation_id).await?;
+    // Unlike a checkout, show every submodule that couldn't be populated.
+    let skipped = std::mem::take(&mut stats.skipped_submodules);
     print_checkout_stats(ui, &stats, &wc_commit)?;
+    for (path, reason) in &skipped {
+        writeln!(
+            ui.warning_default(),
+            "Submodule at {}: {reason}",
+            path.as_internal_file_string()
+        )?;
+    }
     Ok(())
 }
 
@@ -338,11 +368,18 @@ async fn cmd_submodule_delete(
     let declared = git_submodule::read_gitmodules(repo.store(), &wc_commit.tree()).await?;
     for name in &args.names {
         if let Some(config) = declared.get(name) {
-            locked_ws
+            let stats = locked_ws
                 .locked_wc()
                 .clear_submodule(&config.path)
                 .await
                 .map_err(|err| internal_error_with_message("Failed to clear submodule", err))?;
+            if let Some((path, reason)) = stats.skipped_submodules.first() {
+                return Err(user_error(format!(
+                    "Submodule at {}: {reason}",
+                    path.as_internal_file_string()
+                ))
+                .hinted("Its repo would be deleted with those changes still unrecorded."));
+            }
         }
     }
     let operation_id = locked_ws.locked_wc().old_operation_id().clone();
@@ -398,7 +435,17 @@ pub(crate) async fn fetch_stored_submodules(
         .chain(also_scan)
     {
         let tree = repo.store().get_commit(id)?.tree();
-        let submodules = git_submodule::read_gitmodules(repo.store(), &tree).await?;
+        let submodules = match git_submodule::read_gitmodules(repo.store(), &tree).await {
+            Ok(submodules) => submodules,
+            Err(err) => {
+                writeln!(
+                    ui.warning_default(),
+                    "Ignoring .gitmodules of commit {}: {err}",
+                    id.hex()
+                )?;
+                continue;
+            }
+        };
         for config in submodules.values() {
             urls.entry(config.name.clone())
                 .or_insert_with(|| resolve_url(workspace_command, &config.url));
@@ -506,7 +553,7 @@ pub(crate) async fn submodule_status(
         problems.sort();
         return Ok(problems);
     }
-    let (mut locked_ws, _)= workspace_command.start_working_copy_mutation().await?;
+    let (mut locked_ws, _) = workspace_command.start_working_copy_mutation().await?;
     let dirty = locked_ws
         .locked_wc()
         .dirty_submodules()

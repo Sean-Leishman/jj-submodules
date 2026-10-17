@@ -247,3 +247,41 @@ loading anything), load stores lazily, and run nested snapshots in parallel.
 - Not done yet from the plan: randomized op sequences, failure injection
   (offline, corrupt nested tree_state, killed mid-populate), perf guard
   re-measure, sparse/type-change/conflict-deletion targeted tests.
+
+### 2026-10-17 — Review pass (code-review + falsifiers), fixes
+
+- Ran `/code-review high` over the whole submodule range plus hand-made
+  falsifiers in scratch repos. Real bugs found and fixed, all with tests:
+  - `jj status` internal error when a submodule's path is a plain file on
+    disk (nested snapshot read_dir failed); now "has local changes".
+  - `jj git fetch --ignore-working-copy`/`--at-op` exited 1 with cloned
+    submodules (auto-populate took the wc lock); populate is skipped there.
+  - `rm -rf sub` then `jj git submodule populate` did nothing (nested state
+    still said "populated"); a missing dir now resets the state.
+  - A dirty submodule whose gitlink moved had the *old* gitlink written into
+    the checkout tree, so the next snapshot recorded a gitlink revert that
+    could be pushed. Now only a gitlink that *leaves* (or changes type) is
+    kept; a moved one stays as the commit says, like Git's "modified
+    content".
+  - Leaving a submodule left ignored files (build dirs) behind without the
+    gitlink, so the superproject snapshotted them as new files. Now the
+    gitlink is kept with a warning; the cleared state counts as unpopulated
+    so coming back repopulates around them.
+  - Same leak via the "not in .gitmodules" branch (after undoing a kept
+    gitlink): now kept too.
+  - Malformed `.gitmodules` made `jj git clone`/`fetch` fail; now a warning.
+  - Relative URLs with `jj git clone --remote=upstream` resolved against the
+    workspace path; now fall back to the only remote.
+  - `jj git submodule delete` silently deleted the repo of a dirty
+    submodule, orphaning the edits; now refused.
+  - `jj sparse set` could clear clean excluded submodules before erroring on
+    a dirty one; dirtiness is checked first. (No test; needs two submodules.)
+  - `populate` showed the same 5-warning cap its own hint pointed at.
+- Verified-but-upstream (not ours): checkout doesn't apply `.gitattributes`
+  eol; a path with a GitSubmodule file state is invisible to snapshot
+  whatever is on disk (so type-change commits in tests use git plumbing).
+- Learned: when the oracle is a reference implementation, assert the
+  reference succeeded (git failed on 72% of old bat commits); `jj file list`
+  lists gitlinks too, which fooled an experiment into testing nothing.
+- jq differential re-run after the behaviour changes: 126 commits, 0
+  mismatches.
