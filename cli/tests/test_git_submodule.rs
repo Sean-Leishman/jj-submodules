@@ -265,6 +265,14 @@ fn test_git_submodule_clone_fetch_delete() {
     Parent commit (@-): Add submodule
     [EOF]
     ");
+    // Read-only status must not need the working-copy lock.
+    let output = work_dir.run_jj(["status", "--ignore-working-copy"]);
+    insta::assert_snapshot!(output, @"
+    The working copy has no changes.
+    Working copy  (@) : 
+    Parent commit (@-): Add submodule
+    [EOF]
+    ");
     // Undo the local changes; the submodule is managed again.
     std::fs::write(&sub_file, "sub\n").unwrap();
     std::fs::remove_file(work_dir.root().join("sub/untracked")).unwrap();

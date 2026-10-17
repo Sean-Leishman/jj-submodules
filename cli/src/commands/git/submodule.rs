@@ -472,7 +472,13 @@ pub(crate) async fn submodule_status(
         };
         problems.push((config.path.clone(), problem));
     }
-    let (mut locked_ws, _) = workspace_command.start_working_copy_mutation().await?;
+    // ponytail: --ignore-working-copy/--at-op skip the dirty check, which
+    // needs the lock; a lock-free read of nested states would cover them.
+    if workspace_command.check_working_copy_writable().is_err() {
+        problems.sort();
+        return Ok(problems);
+    }
+    let (mut locked_ws, _)= workspace_command.start_working_copy_mutation().await?;
     let dirty = locked_ws
         .locked_wc()
         .dirty_submodules()
