@@ -223,3 +223,27 @@ loading anything), load stores lazily, and run nested snapshots in parallel.
 - Wart (documented in test, not fixed): a dirty submodule left in place
   differs from @, so the next command snapshots its HEAD as the gitlink
   (Git-like, `git add -A`) and `jj undo` then needs to run twice.
+- Unfetchable gitlink (commit gone upstream): clone/fetch/status all warn
+  (I3 ✓). Fixed: `fetch_submodule` now returns still-missing hashes and the
+  CLI says so; before, the failure was only `tracing::info!` and the only
+  hint was "run `jj git submodule fetch`" — the command just run.
+- Colocated superproject: `git status --porcelain` clean after jj populates.
+- Git differential, jq: 221 commits over all history incl. the 2025
+  `modules/` → `vendor/` move: 0 mismatches once the script follows the
+  "not cloned; run clone" hint (old commits declare a differently *named*
+  submodule; git's `--init` clones on demand, jj checkout stays offline by
+  design).
+- Git differential, bat (all history): unreliable oracle — git's own
+  checkout failed on 44/61 old commits (dead URLs, commits gone). On the
+  rest: nested submodules (Dart → sublime_plugin_lib) were left empty
+  *silently*. Fixed: warning on checkout + "Submodules:" line in status
+  (ponytail: no nested population). Also `build.bat` differs: git applies
+  `.gitattributes` eol, jj doesn't — upstream jj, not submodule-related.
+- Old gitlinks on no branch aren't fetched by `jj git clone` (only @'s);
+  checkout warns with a fetch hint. By design (offline checkout).
+- Git differential, bat (last 300 commits, 43 sampled, after the nested
+  fix): git's checkout failed on 10 (skipped); on the other 33 every
+  submodule file matches and status is clean. Only diff: `build.bat` eol.
+- Not done yet from the plan: randomized op sequences, failure injection
+  (offline, corrupt nested tree_state, killed mid-populate), perf guard
+  re-measure, sparse/type-change/conflict-deletion targeted tests.
