@@ -285,3 +285,27 @@ loading anything), load stores lazily, and run nested snapshots in parallel.
   lists gitlinks too, which fooled an experiment into testing nothing.
 - jq differential re-run after the behaviour changes: 126 commits, 0
   mismatches.
+
+### 2026-10-17 — Remaining plan items: randomized sequences, failure injection, sparse
+
+- `test_git_submodule_random_sequences`: xorshift seeds 1..4 × 16 steps of
+  edit/untracked/discard/new/undo/populate/set; after each, local edits
+  intact, `sub/sub`+`sub/untracked` never in status/diff, no internal error.
+  Passed first time once the earlier fixes were in (~10 s; bump seeds if it
+  gets cheaper).
+- Failure injection found two more I2 leaks, fixed: a submodule whose repo
+  vanished from the store, or that was cleared leaving ignored files, lost
+  its gitlink on checkout and its files were snapshotted as new superproject
+  files. `prepare_submodules` now keeps the gitlink whenever it can't load
+  the nested state and the gitlink leaves. `stays` also tolerates a missing
+  *old* `.gitmodules` (a kept gitlink has none), else coming back to such a
+  submodule looked like leaving it.
+- Corrupt nested `tree_state` is read as empty (cleared) and self-heals on
+  populate; a state dir without `tree_state` likewise. Populating over files
+  already on disk never overwrites them ("skipped" warning, upstream text).
+- Bad submodule URL: auto-clone warns, explicit clone errors.
+- Two-submodule sparse test: refusing on one dirty submodule leaves the clean
+  one untouched; now a user error (`CheckoutError::DirtySubmodule`), not
+  "Internal error".
+- bat differential re-run (43 commits, last 300): only `build.bat` eol diffs,
+  same as before today's changes.

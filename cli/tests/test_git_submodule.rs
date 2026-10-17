@@ -262,7 +262,6 @@ fn test_git_submodule_clone_fetch_delete() {
     Working copy  (@) now at: 
     Parent commit (@-)      : Add submodule
     Added 1 files, modified 0 files, removed 0 files
-    Warning: Submodule at sub: it has local changes, which jj cannot snapshot yet; the directory was left as is
     [EOF]
     ");
     assert_eq!(std::fs::read_to_string(&sub_file).unwrap(), "local edit\n");
@@ -1421,4 +1420,362 @@ fn test_git_submodule_bad_gitmodules() {
     Parent commit (@-): Break .gitmodules
     [EOF]
     ");
+}
+
+#[test]
+fn test_git_submodule_sparse_two_submodules() {
+    let test_env = TestEnvironment::default();
+    let work_dir = set_up_superproject(&test_env);
+    work_dir
+        .run_jj_with(|cmd| {
+            cmd.env("GIT_AUTHOR_DATE", "2001-02-03T04:05:06+07:00")
+                .env("GIT_COMMITTER_DATE", "2001-02-03T04:05:06+07:00")
+                .args([
+                    "util",
+                    "exec",
+                    "--",
+                    "sh",
+                    "-c",
+                    &format!(
+                        "git -c protocol.file.allow=always submodule add -q {}/submodule sub2 && \
+                         git -c user.email=test@example.com -c user.name='Test user' commit -qm \
+                         'Add sub2'",
+                        test_env.env_root().display()
+                    ),
+                ])
+        })
+        .success();
+    std::fs::remove_dir_all(work_dir.root().join("sub2")).unwrap();
+    work_dir
+        .run_jj(["git", "submodule", "clone", "--all"])
+        .success();
+    let sub_file = work_dir.root().join("sub/sub");
+    let sub2_file = work_dir.root().join("sub2/sub");
+    assert!(sub_file.exists() && sub2_file.exists());
+
+    // Excluding both with one dirty: refused, and the clean one is untouched.
+    std::fs::write(&sub2_file, "edit\n").unwrap();
+    let output = work_dir.run_jj(["sparse", "set", "--clear", "--add=.gitmodules"]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Error: Submodule at sub2 has local changes; commit or discard them first
+    [EOF]
+    [exit status: 1]
+    ");
+    assert_eq!(std::fs::read_to_string(&sub_file).unwrap(), "sub\n");
+    assert_eq!(std::fs::read_to_string(&sub2_file).unwrap(), "edit\n");
+    let output = work_dir.run_jj(["sparse", "list"]);
+    insta::assert_snapshot!(output, @"
+    .
+    [EOF]
+    ");
+
+    // Clean again: both are cleared, and reset repopulates them.
+    std::fs::write(&sub2_file, "sub\n").unwrap();
+    let output = work_dir.run_jj(["sparse", "set", "--clear", "--add=.gitmodules"]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Added 0 files, modified 0 files, removed 4 files
+    [EOF]
+    ");
+    assert!(!sub_file.exists() && !sub2_file.exists());
+    let output = work_dir.run_jj(["status"]);
+    insta::assert_snapshot!(output, @"
+    The working copy has no changes.
+    Working copy  (@) : 
+    Parent commit (@-): Add sub2
+    [EOF]
+    ");
+    let output = work_dir.run_jj(["sparse", "reset"]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Added 4 files, modified 0 files, removed 0 files
+    [EOF]
+    ");
+    assert!(sub_file.exists() && sub2_file.exists());
+}
+
+#[test]
+fn test_git_submodule_failure_injection() {
+    let test_env = TestEnvironment::default();
+    let work_dir = set_up_superproject(&test_env);
+    let sub_file = work_dir.root().join("sub/sub");
+    work_dir
+        .run_jj(["git", "submodule", "clone", "sub"])
+        .success();
+
+    // The submodule repo vanished from the store.
+    let store_dir = work_dir.root().join(".jj/repo/submodule_store/sub");
+    assert!(store_dir.is_dir(), "store layout changed");
+    std::fs::remove_dir_all(&store_dir).unwrap();
+    let output = work_dir.run_jj(["status"]);
+    insta::assert_snapshot!(output, @"
+    The working copy has no changes.
+    Submodules:
+      sub: not cloned; run `jj git submodule clone sub`
+    Working copy  (@) : 
+    Parent commit (@-): Add submodule
+    [EOF]
+    ");
+    let output = work_dir.run_jj(["new", "root()"]);
+    insta::assert_snapshot!(output, @r#"
+    ------- stderr -------
+    Working copy  (@) now at: 
+    Parent commit (@-)      : 
+    Added 0 files, modified 0 files, removed 1 files
+    Warning: Submodule at sub: submodule "sub" is no longer cloned; its populated files were left in place
+    [EOF]
+    "#);
+    assert_eq!(std::fs::read_to_string(&sub_file).unwrap(), "sub\n");
+    let output = work_dir.run_jj(["status"]);
+    insta::assert_snapshot!(output, @"
+    Working copy changes:
+    A sub
+    Working copy  (@) : 
+    Parent commit (@-): 
+    [EOF]
+    ");
+    work_dir.run_jj(["new", "master"]).success();
+    let output = work_dir.run_jj(["git", "submodule", "clone", "sub"]);
+    insta::assert_snapshot!(output, @r#"
+    ------- stderr -------
+    Cloning submodule "sub" from $TEST_ENV/submodule
+    [EOF]
+    "#);
+    assert_eq!(std::fs::read_to_string(&sub_file).unwrap(), "sub\n");
+
+    // Corrupt nested state: a clear error, and deleting it recovers.
+    let state_file = work_dir
+        .root()
+        .join(".jj/working_copy/submodules/sub/tree_state");
+    assert!(state_file.is_file(), "state layout changed");
+    std::fs::write(&state_file, b"garbage").unwrap();
+    let output = work_dir.run_jj(["status"]);
+    insta::assert_snapshot!(output, @"
+    The working copy has no changes.
+    Working copy  (@) : 
+    Parent commit (@-): Add submodule
+    [EOF]
+    ");
+    let output = work_dir.run_jj(["new"]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Working copy  (@) now at: 
+    Parent commit (@-)      : 
+    [EOF]
+    ");
+    std::fs::remove_dir_all(state_file.parent().unwrap()).unwrap();
+    // Files already on disk are never overwritten (hence "skipped").
+    let output = work_dir
+        .run_jj(["git", "submodule", "populate"])
+        .normalize_stderr_with(hide_ids);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Added 1 files, modified 0 files, removed 0 files
+    Warning: 1 of those updates were skipped because there were conflicting changes in the working copy.
+    Hint: Inspect the changes compared to the intended target with `jj diff --from [id]`.
+    Discard the conflicting changes with `jj restore --from [id]`.
+    [EOF]
+    ");
+    let output = work_dir.run_jj(["status"]);
+    insta::assert_snapshot!(output, @"
+    The working copy has no changes.
+    Working copy  (@) : 
+    Parent commit (@-): 
+    [EOF]
+    ");
+
+    // Interrupted populate: a state directory without a tree state.
+    std::fs::remove_file(&state_file).unwrap();
+    let output = work_dir.run_jj(["status"]);
+    insta::assert_snapshot!(output, @"
+    The working copy has no changes.
+    Working copy  (@) : 
+    Parent commit (@-): 
+    [EOF]
+    ");
+    let output = work_dir
+        .run_jj(["git", "submodule", "populate"])
+        .normalize_stderr_with(hide_ids);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Added 1 files, modified 0 files, removed 0 files
+    Warning: 1 of those updates were skipped because there were conflicting changes in the working copy.
+    Hint: Inspect the changes compared to the intended target with `jj diff --from [id]`.
+    Discard the conflicting changes with `jj restore --from [id]`.
+    [EOF]
+    ");
+    assert!(state_file.is_file());
+
+    // Unreachable submodule URL: automatic clone warns, explicit clone errors.
+    work_dir.write_file(
+        ".gitmodules",
+        "[submodule \"sub\"]\n\tpath = sub\n\turl = /nonexistent/submodule\n",
+    );
+    work_dir.run_jj(["commit", "-m", "Bad URL"]).success();
+    work_dir
+        .run_jj(["bookmark", "set", "master", "-r", "@-"])
+        .success();
+    let output = test_env.run_jj_in(
+        ".",
+        [
+            "git",
+            "clone",
+            &format!("{}/repo", test_env.env_root().display()),
+            "clone",
+        ],
+    );
+    insta::assert_snapshot!(output, @r#"
+    ------- stderr -------
+    Fetching into new repo in "$TEST_ENV/clone"
+    bookmark: master@origin [new] tracked
+    Setting the revset alias `trunk()` to `master@origin`.
+    Cloning submodule "sub" from /nonexistent/submodule
+    Warning: Failed to clone submodule "sub": Could not find repository at '/nonexistent/submodule'
+    Working copy  (@) now at: 
+    Parent commit (@-)      : Bad URL
+    Added 2 files, modified 0 files, removed 0 files
+    Warning: Submodule at sub: submodule "sub" is not cloned; run `jj git submodule clone sub`
+    [EOF]
+    "#);
+    let clone_dir = test_env.work_dir("clone");
+    let output = clone_dir.run_jj(["git", "submodule", "clone", "sub"]);
+    insta::assert_snapshot!(output, @r#"
+    ------- stderr -------
+    Cloning submodule "sub" from /nonexistent/submodule
+    Error: Could not find repository at '/nonexistent/submodule'
+    [EOF]
+    [exit status: 1]
+    "#);
+    let output = clone_dir.run_jj(["git", "submodule", "list"]);
+    insta::assert_snapshot!(output, @"");
+}
+
+/// Random command sequences; after each one, local changes inside the
+/// submodule are intact, its files never show up as the superproject's, and
+/// no command fails internally.
+#[test]
+fn test_git_submodule_random_sequences() {
+    let test_env = TestEnvironment::default();
+    let work_dir = set_up_superproject(&test_env);
+    let submodule_dir = test_env.work_dir("submodule");
+    let sub_dir = work_dir.root().join("sub");
+    let sub_file = sub_dir.join("sub");
+    submodule_dir.write_file("sub", "next\n");
+    submodule_dir.run_jj(["commit", "-m", "Next"]).success();
+    submodule_dir
+        .run_jj(["bookmark", "create", "-r", "@-", "next"])
+        .success();
+    work_dir
+        .run_jj([
+            "util",
+            "exec",
+            "--",
+            "sh",
+            "-c",
+            "set -e
+            export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
+            gm=$(git rev-parse HEAD:.gitmodules)
+            blob=$(echo f | git hash-object -w --stdin)
+            tree=$(printf '100644 blob %s\\t.gitmodules\\n100644 blob %s\\tsub\\n' $gm $blob | git mktree)
+            git update-ref refs/heads/file $(git commit-tree $tree -p HEAD -m file)",
+        ])
+        .success();
+    work_dir
+        .run_jj(["git", "submodule", "clone", "sub"])
+        .success();
+    work_dir
+        .run_jj(["git", "submodule", "set", "sub", "next@origin"])
+        .success();
+    work_dir
+        .run_jj(["bookmark", "create", "-r", "@", "bumped"])
+        .success();
+    work_dir.run_jj(["new", "master"]).success();
+
+    let targets = ["master", "bumped", "file", "root()"];
+    let mut log = String::new();
+    for seed in 1..=4u64 {
+        let mut rng = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let mut edit: Option<String> = None;
+        let mut untracked = false;
+        for step in 0..16 {
+            let op = next() % 8;
+            let output = match op {
+                0 if sub_dir.is_dir() => {
+                    let content = format!("edit {seed} {step}\n");
+                    std::fs::write(&sub_file, &content).unwrap();
+                    edit = Some(content);
+                    log += "edit; ";
+                    continue;
+                }
+                1 if sub_dir.is_dir() => {
+                    work_dir.write_file("sub/untracked", "untracked\n");
+                    untracked = true;
+                    log += "untracked; ";
+                    continue;
+                }
+                2 => {
+                    // Discard local changes and repopulate.
+                    if sub_dir.is_dir() {
+                        std::fs::remove_dir_all(&sub_dir).unwrap();
+                    }
+                    edit = None;
+                    untracked = false;
+                    log += "discard; ";
+                    work_dir.run_jj(["git", "submodule", "populate"])
+                }
+                3 | 4 => {
+                    let target = targets[(next() % targets.len() as u64) as usize];
+                    log += &format!("new {target}; ");
+                    work_dir.run_jj(["new", target])
+                }
+                5 => {
+                    log += "undo; ";
+                    work_dir.run_jj(["undo"])
+                }
+                6 => {
+                    log += "populate; ";
+                    work_dir.run_jj(["git", "submodule", "populate"])
+                }
+                _ => {
+                    let rev = ["main@origin", "next@origin"][(next() % 2) as usize];
+                    log += &format!("set {rev}; ");
+                    work_dir.run_jj(["git", "submodule", "set", "sub", rev])
+                }
+            };
+            let status = work_dir.run_jj(["status"]);
+            let diff = work_dir.run_jj(["diff", "--summary"]);
+            let all = format!("{output}{status}{diff}");
+            assert!(
+                !all.contains("Internal error") && !all.contains("panicked"),
+                "seed {seed}, after `{log}`:\n{all}"
+            );
+            if let Some(content) = &edit {
+                assert_eq!(
+                    std::fs::read_to_string(&sub_file).unwrap_or_default(),
+                    *content,
+                    "seed {seed}, local edit lost after `{log}`:\n{all}"
+                );
+            }
+            if untracked {
+                assert!(
+                    sub_dir.join("untracked").exists(),
+                    "seed {seed}, untracked file lost after `{log}`:\n{all}"
+                );
+            }
+            for leaked in ["sub/sub", "sub/untracked"] {
+                assert!(
+                    !format!("{status}{diff}").contains(leaked),
+                    "seed {seed}, {leaked} leaked after `{log}`:\n{all}"
+                );
+            }
+        }
+        log.clear();
+    }
 }

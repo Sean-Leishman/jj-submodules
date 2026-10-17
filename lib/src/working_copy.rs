@@ -326,6 +326,12 @@ pub enum CheckoutError {
     /// Failed to load the working copy state.
     #[error(transparent)]
     WorkingCopyStateError(#[from] WorkingCopyStateError),
+    /// A populated submodule has local changes that the operation would lose.
+    #[error("Submodule at {} has local changes; commit or discard them first", path.as_internal_file_string())]
+    DirtySubmodule {
+        /// Path of the submodule in the working copy.
+        path: RepoPathBuf,
+    },
     /// Some other error happened while checking out the working copy.
     #[error("{message}")]
     Other {

@@ -3180,8 +3180,11 @@ impl LockedLocalWorkingCopy {
             let old_value = old_tree.path_value(&path).await?;
             let new_value = new_tree.path_value(&path).await?;
             let new_name = new_map.get(&path);
+            // No old entry: coming back to a submodule whose gitlink was kept.
             let stays = new_name.is_some()
-                && new_name == old_map.get(&path)
+                && old_map
+                    .get(&path)
+                    .is_none_or(|old_name| Some(old_name) == new_name)
                 && new_matcher.matches(&path)
                 && matches!(new_value.as_normal(), Some(TreeValue::GitSubmodule(_)));
             if stays && new_value == old_value {
@@ -3198,6 +3201,11 @@ impl LockedLocalWorkingCopy {
                 continue;
             };
             let Some((sub_store, mut state)) = self.load_nested(&path, name, stats)? else {
+                if !stays {
+                    // Repo gone or only ignored files left: keep the gitlink so
+                    // the files are neither deleted nor snapshotted.
+                    kept.push((path, old_value));
+                }
                 continue;
             };
             if nested_is_dirty(&mut state)? {
@@ -3558,13 +3566,7 @@ impl LockedWorkingCopy for LockedLocalWorkingCopy {
                     continue;
                 };
                 if nested_is_dirty(&mut state)? {
-                    return Err(submodule_state_error(
-                        &format!(
-                            "Submodule at {} has local changes; commit or discard them first",
-                            path.as_internal_file_string()
-                        ),
-                        "cannot change sparse patterns over a modified submodule",
-                    ));
+                    return Err(CheckoutError::DirtySubmodule { path });
                 }
             }
             self.prepare_submodules(&tree, &tree, &new_matcher, &mut stats)

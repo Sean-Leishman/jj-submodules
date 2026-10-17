@@ -19,6 +19,7 @@ mod set;
 
 use clap::Subcommand;
 use jj_lib::repo_path::RepoPathBuf;
+use jj_lib::working_copy::CheckoutError;
 use tracing::instrument;
 
 use self::edit::SparseEditArgs;
@@ -34,6 +35,7 @@ use crate::cli_util::WorkspaceCommandHelper;
 use crate::cli_util::print_checkout_stats;
 use crate::command_error::CommandError;
 use crate::command_error::internal_error_with_message;
+use crate::command_error::user_error;
 use crate::ui::Ui;
 
 /// Manage which paths from the working-copy commit are present in the working
@@ -71,7 +73,10 @@ async fn update_sparse_patterns_with(
         .locked_wc()
         .set_sparse_patterns(new_patterns)
         .await
-        .map_err(|err| internal_error_with_message("Failed to update working copy paths", err))?;
+        .map_err(|err| match err {
+            CheckoutError::DirtySubmodule { .. } => user_error(err.to_string()),
+            err => internal_error_with_message("Failed to update working copy paths", err),
+        })?;
     let operation_id = locked_ws.locked_wc().old_operation_id().clone();
     locked_ws.finish(operation_id).await?;
     print_checkout_stats(ui, &stats, &wc_commit)?;
