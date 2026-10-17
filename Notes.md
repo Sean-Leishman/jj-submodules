@@ -203,3 +203,23 @@ loading anything), load stores lazily, and run nested snapshots in parallel.
 - Not done: marking which commit the superproject points at in the graph.
 - With this, all six Phase 1 outcomes have a CLI path. The conflict one is
   CLI-only (`set`); the builtin merge tool panic (#7386) is still open.
+
+### 2026-10-17 — Submodule testing plan, first results
+
+- Plan (oracle = invariants, checked after every step): I1 local submodule
+  changes never clobbered; I2 submodule files never in superproject
+  snapshots; I3 missing clone/commit/network = warning on automatic paths;
+  I4 working tree matches `git checkout --recurse-submodules`; I5 undo/op
+  restore keep submodule dirs consistent with @.
+- Methods, in order: targeted insta tests per gap; Git differential script
+  over real histories (scratchpad `diff/differential.sh`, not committed);
+  randomized op sequences; failure injection; perf guard (no regression
+  without submodules; bat status ≤ ~75 ms dev-opt3).
+- Falsifier #1 found a real bug: `jj status --ignore-working-copy`/`--at-op`
+  exited 1 in any repo with submodules (dirty check took the wc lock). Fixed
+  by skipping the dirty check when the wc is read-only (ponytail).
+- I5 + workspaces test passes: undo/op restore repopulate; second workspace
+  gets its own checkout; abandon/rebase/delete keep local submodule edits.
+- Wart (documented in test, not fixed): a dirty submodule left in place
+  differs from @, so the next command snapshots its HEAD as the gitlink
+  (Git-like, `git add -A`) and `jj undo` then needs to run twice.

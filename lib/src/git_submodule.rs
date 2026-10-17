@@ -223,7 +223,7 @@ pub fn resolve_submodule_url(url: &str, base: &str) -> String {
 }
 
 /// Creates a new workspace-less repo for submodule `name` in `store` and
-/// fetches all branches and tags from `url`.
+/// fetches it from `url` like [`fetch_submodule`].
 pub async fn clone_submodule(
     store: &dyn SubmoduleStore,
     settings: &UserSettings,
@@ -232,7 +232,7 @@ pub async fn clone_submodule(
     object_hash: gix::hash::Kind,
     wanted: &[CommitId],
     callback: &mut dyn GitSubprocessCallback,
-) -> Result<GitImportStats, GitSubmoduleError> {
+) -> Result<(GitImportStats, Vec<CommitId>), GitSubmoduleError> {
     let repo_path = store.repo_path(name);
     if repo_path.exists() {
         return Err(GitSubmoduleError::AlreadyExists(name.to_owned()));
@@ -279,7 +279,7 @@ pub async fn clone_submodule(
 /// Fetches all branches and tags of a submodule repo from its remote, then
 /// any of the `wanted` commits (typically the superproject's gitlinks) that
 /// are still missing, by hash. A remote may refuse the latter; that is not an
-/// error, the commit just stays missing.
+/// error, the commit just stays missing and is returned.
 ///
 /// Unreachable commits are never abandoned: the superproject may reference
 /// submodule commits that are on no branch.
@@ -288,7 +288,7 @@ pub async fn fetch_submodule(
     settings: &UserSettings,
     wanted: &[CommitId],
     callback: &mut dyn GitSubprocessCallback,
-) -> Result<GitImportStats, GitSubmoduleError> {
+) -> Result<(GitImportStats, Vec<CommitId>), GitSubmoduleError> {
     let git_settings = GitSettings::from_settings(settings)?;
     let import_options = GitImportOptions {
         abandon_unreachable_commits: false,
@@ -344,7 +344,12 @@ pub async fn fetch_submodule(
             }
         }
     }
-    Ok(stats)
+    let still_missing = missing
+        .into_iter()
+        .filter(|id| store.get_commit(id).is_err())
+        .cloned()
+        .collect();
+    Ok((stats, still_missing))
 }
 
 #[cfg(test)]

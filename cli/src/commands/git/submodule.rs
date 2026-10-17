@@ -249,7 +249,7 @@ async fn clone_one(
         "Cloning submodule {:?} from {url}",
         config.name
     )?;
-    let stats = git_submodule::clone_submodule(
+    let (stats, missing) = git_submodule::clone_submodule(
         repo.submodule_store().as_ref(),
         workspace_command.settings(),
         &config.name,
@@ -259,7 +259,20 @@ async fn clone_one(
         &mut GitSubprocessUi::new(ui),
     )
     .await?;
-    print_git_import_stats_summary(ui, &stats)
+    print_git_import_stats_summary(ui, &stats)?;
+    warn_unfetched(ui, &config.name, &missing)
+}
+
+fn warn_unfetched(ui: &Ui, name: &str, missing: &[CommitId]) -> Result<(), CommandError> {
+    for id in missing {
+        writeln!(
+            ui.warning_default(),
+            "Could not fetch commit {} of submodule {name:?}: the remote doesn't have it or \
+             refuses to serve it by hash",
+            id.hex()
+        )?;
+    }
+    Ok(())
 }
 
 fn fetch_url(repo: &ReadonlyRepo, remote: &str) -> Option<String> {
@@ -429,7 +442,10 @@ pub(crate) async fn fetch_stored_submodules(
         )
         .await;
         match result {
-            Ok(stats) => print_git_import_stats_summary(ui, &stats)?,
+            Ok((stats, missing)) => {
+                print_git_import_stats_summary(ui, &stats)?;
+                warn_unfetched(ui, name, &missing)?;
+            }
             Err(err) if best_effort => {
                 writeln!(
                     ui.warning_default(),

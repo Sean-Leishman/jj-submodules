@@ -770,6 +770,9 @@ fn test_git_submodule_undo_workspaces_and_rewrites() {
     work_dir.run_jj(["git", "submodule", "fetch"]).success();
     work_dir.run_jj(["new", "master"]).success();
     assert_eq!(std::fs::read_to_string(&sub_file).unwrap(), "sub\n");
+    // In the colocated superproject, git sees jj's checkout as clean.
+    let output = work_dir.run_jj(["util", "exec", "--", "git", "status", "--porcelain"]);
+    insta::assert_snapshot!(output, @"");
 
     // Undo and op restore move the submodule checkout along with @.
     work_dir
@@ -779,7 +782,7 @@ fn test_git_submodule_undo_workspaces_and_rewrites() {
     let output = work_dir.run_jj(["undo"]).normalize_stderr_with(hide_ids);
     insta::assert_snapshot!(output, @"
     ------- stderr -------
-    Undid operation: [id] (2001-02-03 08:05:18) set submodule sub to [id] in commit [id]
+    Undid operation: [id] (2001-02-03 08:05:19) set submodule sub to [id] in commit [id]
     Restored to operation: [id] (2001-02-03 08:05:17) new empty commit
     Working copy  (@) now at: 
     Parent commit (@-)      : Add submodule
@@ -790,7 +793,7 @@ fn test_git_submodule_undo_workspaces_and_rewrites() {
     let output = work_dir.run_jj(["op", "restore", "@-"]).normalize_stderr_with(hide_ids);
     insta::assert_snapshot!(output, @"
     ------- stderr -------
-    Restored to operation: [id] (2001-02-03 08:05:18) set submodule sub to [id] in commit [id]
+    Restored to operation: [id] (2001-02-03 08:05:19) set submodule sub to [id] in commit [id]
     Working copy  (@) now at: 
     Parent commit (@-)      : Add submodule
     Added 0 files, modified 2 files, removed 0 files
@@ -884,7 +887,7 @@ fn test_git_submodule_undo_workspaces_and_rewrites() {
       
     Hint: To resolve the conflicts, start by creating a commit on top of
     the conflicted commit:
-      jj new xtnwkqum
+      jj new nmzmmopx
     Then use `jj resolve`, or edit the conflict markers in the file directly.
     Once the conflicts are resolved, you can inspect the result with `jj diff`.
     Then run `jj squash` to move the resolution into the conflicted commit.
@@ -897,8 +900,8 @@ fn test_git_submodule_undo_workspaces_and_rewrites() {
     let output = work_dir.run_jj(["undo"]).normalize_stderr_with(hide_ids);
     insta::assert_snapshot!(output, @"
     ------- stderr -------
-    Undid operation: [id] (2001-02-03 08:05:31) snapshot working copy
-    Restored to operation: [id] (2001-02-03 08:05:30) rebase commit [id]
+    Undid operation: [id] (2001-02-03 08:05:32) snapshot working copy
+    Restored to operation: [id] (2001-02-03 08:05:31) rebase commit [id]
     Working copy  (@) now at: 
     Parent commit (@-)      : 
     Added 0 files, modified 1 files, removed 0 files
@@ -912,7 +915,7 @@ fn test_git_submodule_undo_workspaces_and_rewrites() {
       
     Hint: To resolve the conflicts, start by creating a commit on top of
     the conflicted commit:
-      jj new xtnwkqum
+      jj new nmzmmopx
     Then use `jj resolve`, or edit the conflict markers in the file directly.
     Once the conflicts are resolved, you can inspect the result with `jj diff`.
     Then run `jj squash` to move the resolution into the conflicted commit.
@@ -926,4 +929,75 @@ fn test_git_submodule_undo_workspaces_and_rewrites() {
     [EOF]
     "#);
     assert_eq!(std::fs::read_to_string(&sub_file).unwrap(), "local edit\n");
+}
+
+#[test]
+fn test_git_submodule_unfetchable_gitlink() {
+    let test_env = TestEnvironment::default();
+    let work_dir = set_up_superproject(&test_env);
+    // The gitlink points at a commit the submodule remote doesn't have (e.g.
+    // force-pushed away).
+    work_dir
+        .run_jj([
+            "util",
+            "exec",
+            "--",
+            "sh",
+            "-c",
+            "git update-index --cacheinfo 160000,1111111111111111111111111111111111111111,sub && \
+             git -c user.email=test@example.com -c user.name='Test user' commit -qm 'Bump'",
+        ])
+        .success();
+
+    // Clone still succeeds; the missing commit is a warning, not an error.
+    let output = test_env.run_jj_in(
+        ".",
+        [
+            "git",
+            "clone",
+            &format!("{}/repo", test_env.env_root().display()),
+            "clone",
+        ],
+    );
+    insta::assert_snapshot!(output, @r#"
+    ------- stderr -------
+    Fetching into new repo in "$TEST_ENV/clone"
+    bookmark: master@origin [new] tracked
+    Setting the revset alias `trunk()` to `master@origin`.
+    Cloning submodule "sub" from $TEST_ENV/submodule
+    Warning: Could not fetch commit 1111111111111111111111111111111111111111 of submodule "sub": the remote doesn't have it or refuses to serve it by hash
+    Working copy  (@) now at: 
+    Parent commit (@-)      : Bump
+    Added 2 files, modified 0 files, removed 0 files
+    Warning: Submodule at sub: commit 1111111111111111111111111111111111111111 is not in submodule "sub"; run `jj git submodule fetch sub`
+    [EOF]
+    "#);
+    let clone_dir = test_env.work_dir("clone");
+    let output = clone_dir.run_jj(["status"]);
+    insta::assert_snapshot!(output, @"
+    The working copy has no changes.
+    Submodules:
+      sub: commit 1111111111111111111111111111111111111111 not fetched; run `jj git submodule fetch sub`
+    Working copy  (@) : 
+    Parent commit (@-): Bump
+    [EOF]
+    ");
+    let output = clone_dir.run_jj(["git", "fetch"]);
+    insta::assert_snapshot!(output, @r#"
+    ------- stderr -------
+    Fetching from Git remotes: origin
+    Nothing changed.
+    Fetching submodule "sub"
+    Warning: Could not fetch commit 1111111111111111111111111111111111111111 of submodule "sub": the remote doesn't have it or refuses to serve it by hash
+    Warning: Submodule at sub: commit 1111111111111111111111111111111111111111 is not in submodule "sub"; run `jj git submodule fetch sub`
+    [EOF]
+    "#);
+    let output = clone_dir.run_jj(["git", "submodule", "fetch"]);
+    insta::assert_snapshot!(output, @r#"
+    ------- stderr -------
+    Fetching submodule "sub"
+    Warning: Could not fetch commit 1111111111111111111111111111111111111111 of submodule "sub": the remote doesn't have it or refuses to serve it by hash
+    Warning: Submodule at sub: commit 1111111111111111111111111111111111111111 is not in submodule "sub"; run `jj git submodule fetch sub`
+    [EOF]
+    "#);
 }
