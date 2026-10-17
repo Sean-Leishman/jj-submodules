@@ -309,3 +309,9 @@ loading anything), load stores lazily, and run nested snapshots in parallel.
   "Internal error".
 - bat differential re-run (43 commits, last 300): only `build.bat` eol diffs,
   same as before today's changes.
+- Filed into the Nordorn vault (Draft notes, to be judged): "Assert the
+  Oracle Ran", "Keep the Marker When You Can't Tell", "Racy Timestamps", plus
+  a conversation source note. Left here as too jj-specific: one refspec per
+  hash; parse-here-evaluate-there revsets.
+- Not re-run: the perf guard on bat (heavy build). `refs/original/` backup
+  from the trailer-stripping filter-branch is still around.
