@@ -15,6 +15,14 @@
 use crate::common::TestEnvironment;
 use crate::common::TestWorkDir;
 
+/// Hides op and commit ids, which vary with the temp dir in `.gitmodules`.
+fn hide_ids(s: String) -> String {
+    regex::Regex::new(r"\b[0-9a-f]{12,40}\b")
+        .unwrap()
+        .replace_all(&s, "[id]")
+        .into_owned()
+}
+
 /// Creates `submodule` (a colocated repo with one file) and `repo`, a
 /// colocated superproject with `submodule` added at `sub` via `git submodule
 /// add` and committed. Returns the superproject work dir.
@@ -238,6 +246,8 @@ fn test_git_submodule_clone_fetch_delete() {
     [EOF]
     ");
     assert_eq!(std::fs::read_to_string(&sub_file).unwrap(), "local edit\n");
+    // Like `git add -A`, the snapshot records the submodule's checked-out
+    // commit as the gitlink, but never its files.
     let output = work_dir.run_jj(["status"]);
     insta::assert_snapshot!(output, @"
     Working copy changes:
@@ -741,4 +751,179 @@ fn test_git_submodule_log() {
     [EOF]
     [exit status: 1]
     "#);
+}
+
+#[test]
+fn test_git_submodule_undo_workspaces_and_rewrites() {
+    let test_env = TestEnvironment::default();
+    let work_dir = set_up_superproject(&test_env);
+    let submodule_dir = test_env.work_dir("submodule");
+    let sub_file = work_dir.root().join("sub").join("sub");
+    work_dir
+        .run_jj(["git", "submodule", "clone", "sub"])
+        .success();
+    submodule_dir.write_file("sub", "next\n");
+    submodule_dir.run_jj(["commit", "-m", "Next"]).success();
+    submodule_dir
+        .run_jj(["bookmark", "create", "-r", "@-", "next"])
+        .success();
+    work_dir.run_jj(["git", "submodule", "fetch"]).success();
+    work_dir.run_jj(["new", "master"]).success();
+    assert_eq!(std::fs::read_to_string(&sub_file).unwrap(), "sub\n");
+
+    // Undo and op restore move the submodule checkout along with @.
+    work_dir
+        .run_jj(["git", "submodule", "set", "sub", "next@origin"])
+        .success();
+    assert_eq!(std::fs::read_to_string(&sub_file).unwrap(), "next\n");
+    let output = work_dir.run_jj(["undo"]).normalize_stderr_with(hide_ids);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Undid operation: [id] (2001-02-03 08:05:18) set submodule sub to [id] in commit [id]
+    Restored to operation: [id] (2001-02-03 08:05:17) new empty commit
+    Working copy  (@) now at: 
+    Parent commit (@-)      : Add submodule
+    Added 0 files, modified 2 files, removed 0 files
+    [EOF]
+    ");
+    assert_eq!(std::fs::read_to_string(&sub_file).unwrap(), "sub\n");
+    let output = work_dir.run_jj(["op", "restore", "@-"]).normalize_stderr_with(hide_ids);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Restored to operation: [id] (2001-02-03 08:05:18) set submodule sub to [id] in commit [id]
+    Working copy  (@) now at: 
+    Parent commit (@-)      : Add submodule
+    Added 0 files, modified 2 files, removed 0 files
+    [EOF]
+    ");
+    assert_eq!(std::fs::read_to_string(&sub_file).unwrap(), "next\n");
+    let output = work_dir.run_jj(["status"]);
+    insta::assert_snapshot!(output, @"
+    Working copy changes:
+    M sub
+    Working copy  (@) : 
+    Parent commit (@-): Add submodule
+    [EOF]
+    ");
+
+    // A second workspace gets its own populated submodule checkout.
+    let output = work_dir.run_jj(["workspace", "add", "../ws2"]);
+    insta::assert_snapshot!(output, @r#"
+    ------- stderr -------
+    Created workspace in "../ws2"
+    Working copy  (@) now at: 
+    Parent commit (@-)      : Add submodule
+    Added 3 files, modified 0 files, removed 0 files
+    [EOF]
+    "#);
+    let ws2_dir = test_env.work_dir("ws2");
+    let output = ws2_dir.run_jj(["status"]);
+    insta::assert_snapshot!(output, @"
+    The working copy has no changes.
+    Working copy  (@) : 
+    Parent commit (@-): Add submodule
+    [EOF]
+    ");
+    let ws2_sub_file = ws2_dir.root().join("sub").join("sub");
+    insta::assert_snapshot!(
+        std::fs::read_to_string(&ws2_sub_file).unwrap_or_else(|err| err.to_string()),
+        @"sub");
+    // Editing in one workspace's submodule doesn't touch the other's.
+    std::fs::write(&sub_file, "local edit\n").unwrap();
+    let output = ws2_dir.run_jj(["status"]);
+    insta::assert_snapshot!(output, @"
+    The working copy has no changes.
+    Working copy  (@) : 
+    Parent commit (@-): Add submodule
+    [EOF]
+    ");
+
+    // Local submodule changes survive commands that move @ by rewriting.
+    let output = work_dir.run_jj(["abandon"]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Abandoned 1 commits:
+      
+    Working copy  (@) now at: 
+    Parent commit (@-)      : Add submodule
+    Warning: Submodule at sub: it has local changes, which jj cannot snapshot yet; the directory was left as is
+    [EOF]
+    ");
+    assert_eq!(std::fs::read_to_string(&sub_file).unwrap(), "local edit\n");
+    let output = work_dir.run_jj(["status"]);
+    insta::assert_snapshot!(output, @"
+    Working copy changes:
+    M sub
+    Submodules:
+      sub: has local changes, which jj does not record yet
+    Working copy  (@) : 
+    Parent commit (@-): Add submodule
+    [EOF]
+    ");
+    // That snapshot is stable: later commands don't snapshot again.
+    let op_id = || {
+        work_dir
+            .run_jj(["op", "log", "-n1", "--no-graph", "-T", "id"])
+            .stdout
+            .into_raw()
+    };
+    let before = op_id();
+    work_dir.run_jj(["status"]).success();
+    assert_eq!(op_id(), before);
+    let output = work_dir.run_jj(["rebase", "-r", "@", "-d", "root()"]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Rebased 1 commits to destination.
+    Working copy  (@) now at: 
+    Parent commit (@-)      : 
+    Added 0 files, modified 0 files, removed 1 files
+    Warning: Submodule at sub: it has local changes, which jj cannot snapshot yet; the directory was left as is
+    Warning: There are unresolved conflicts at these paths:
+    sub    2-sided conflict including 1 deletion and a git submodule
+    New conflicts appeared in 1 commits:
+      
+    Hint: To resolve the conflicts, start by creating a commit on top of
+    the conflicted commit:
+      jj new xtnwkqum
+    Then use `jj resolve`, or edit the conflict markers in the file directly.
+    Once the conflicts are resolved, you can inspect the result with `jj diff`.
+    Then run `jj squash` to move the resolution into the conflicted commit.
+    [EOF]
+    ");
+    assert_eq!(std::fs::read_to_string(&sub_file).unwrap(), "local edit\n");
+    // ponytail: the dirty submodule left in place differs from @, so the
+    // next command snapshots it and `jj undo` undoes that snapshot, not the
+    // rebase; a second undo is needed.
+    let output = work_dir.run_jj(["undo"]).normalize_stderr_with(hide_ids);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Undid operation: [id] (2001-02-03 08:05:31) snapshot working copy
+    Restored to operation: [id] (2001-02-03 08:05:30) rebase commit [id]
+    Working copy  (@) now at: 
+    Parent commit (@-)      : 
+    Added 0 files, modified 1 files, removed 0 files
+    Warning: 1 of those updates were skipped because there were conflicting changes in the working copy.
+    Hint: Inspect the changes compared to the intended target with `jj diff --from [id]`.
+    Discard the conflicting changes with `jj restore --from [id]`.
+    Warning: Submodule at sub: not in .gitmodules; its populated files were left in place
+    Warning: There are unresolved conflicts at these paths:
+    sub    2-sided conflict including 1 deletion and a git submodule
+    New conflicts appeared in 1 commits:
+      
+    Hint: To resolve the conflicts, start by creating a commit on top of
+    the conflicted commit:
+      jj new xtnwkqum
+    Then use `jj resolve`, or edit the conflict markers in the file directly.
+    Once the conflicts are resolved, you can inspect the result with `jj diff`.
+    Then run `jj squash` to move the resolution into the conflicted commit.
+    [EOF]
+    ");
+    assert_eq!(std::fs::read_to_string(&sub_file).unwrap(), "local edit\n");
+    let output = work_dir.run_jj(["git", "submodule", "delete", "sub"]);
+    insta::assert_snapshot!(output, @r#"
+    ------- stderr -------
+    Deleted submodule "sub"
+    [EOF]
+    "#);
+    assert_eq!(std::fs::read_to_string(&sub_file).unwrap(), "local edit\n");
 }
