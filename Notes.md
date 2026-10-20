@@ -315,3 +315,24 @@ loading anything), load stores lazily, and run nested snapshots in parallel.
   hash; parse-here-evaluate-there revsets.
 - Not re-run: the perf guard on bat (heavy build). `refs/original/` backup
   from the trailer-stripping filter-branch is still around.
+
+### 2026-10-20 — Rebased onto upstream main (256 commits, 7 Sep → 20 Oct)
+
+- Conflicts were small: changelog/lockfile/one factory call in the first
+  commit, then `git fetch` and `status` API drift, then changelog-only ones
+  (resolved by a six-line "head.replace(base, theirs)" script).
+- Upstream MSRV is now 1.97.1; installed with `rustup toolchain install
+  1.97.1` next to the 1.96 default, build with `cargo +1.97.1`.
+- API drift fixed in one follow-up commit: `signer_from_settings`,
+  `ReadonlyRepo::init` takes a workspace-store initializer, `GitFetch::fetch`
+  takes the ref expression itself, `MergedTreeBuilder::set_or_remove` takes
+  `Option<TreeValue>` (kept gitlinks now go through `set_or_remove_merge`).
+- Upstream `jj git fetch` no longer writes `refs/remotes/` in non-colocated
+  repos (refs land in `refs/jj/remote-bookmarks/`); only the test helper that
+  read the submodule's git log cared. New "Fetching from Git remotes" line in
+  fetch snapshots.
+- Verified with 1.97.1: workspace check clean, 16 submodule tests, 94
+  working-copy tests, fmt. Old tip kept as branch `main-pre-rebase`.
+- Drafted a comment for jj-vcs/jj#494 asking whether direct store access
+  from the nested working copy is acceptable (scratchpad `upstream-post.md`,
+  not posted; needs a public fork to link).
