@@ -378,3 +378,29 @@ loading anything), load stores lazily, and run nested snapshots in parallel.
   only thing referencing amended-away snapshots, so a future submodule gc
   must treat superproject gitlinks as roots.
 - Not run: clippy (not installed for 1.97.1).
+
+### 2026-11-15 — falsifier for updating a snapshotted submodule (rebase): passed
+
+- Question: once local submodule edits are a snapshot commit `B` on the old
+  gitlink `A`, how do you move to a fetched upstream `C`? `set sub
+  main@origin` would just check out `C` (edits stay in `B`, off the working
+  copy). What's wanted is `B` rebased onto `C` and the gitlink on the result.
+- `test_git_submodule_rebase_by_hand` does that through the library
+  (`rewrite::rebase_commit` in a submodule-repo transaction, then `submodule
+  set`). Clean case: edit kept, upstream file appears, undo/redo move both.
+  Conflict case, the one expected to fail, also passes with no non-test
+  change: the conflicted commit sits behind the gitlink, Git reads it, jj
+  materializes the markers into the submodule file, the unchanged markers do
+  NOT read as "local changes", undo returns the pre-rebase file, and writing
+  a resolution + snapshot (amend) yields an unconflicted commit.
+- Phase 2 plan gains `jj git submodule rebase <name> -d <revset>` (rebase the
+  snapshot commit, move the gitlink). No general "run jj in the submodule"
+  passthrough.
+- Gaps seen, not built: the superproject shows nothing for a gitlink whose
+  submodule commit is conflicted (`jj status` just says `M sub`; it should
+  say so, and `submodule push` must refuse it); `jj git submodule log` has
+  no `--no-graph`.
+- Test hygiene: `hide_ids` only hid 12-40 hex chars, so the 128-char op id in
+  "redo: restore to operation ..." leaked into a snapshot; widened to 128.
+  Commits written from the test process get wall-clock timestamps, so their
+  ids must never reach a snapshot.

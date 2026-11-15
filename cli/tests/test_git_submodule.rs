@@ -12,12 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::sync::Arc;
+
+use jj_lib::backend::CommitId;
+use jj_lib::commit::Commit;
+use jj_lib::default_backend_factories::default_backend_factories;
+use jj_lib::local_working_copy::TreeState;
+use jj_lib::local_working_copy::TreeStateSettings;
+use jj_lib::object_id::ObjectId as _;
+use jj_lib::repo::ReadonlyRepo;
+use jj_lib::repo::Repo as _;
+use jj_lib::repo::RepoLoader;
+use jj_lib::rewrite::rebase_commit;
+use pollster::FutureExt as _;
+
 use crate::common::TestEnvironment;
 use crate::common::TestWorkDir;
 
 /// Hides op and commit ids, which vary with the temp dir in `.gitmodules`.
 fn hide_ids(s: String) -> String {
-    regex::Regex::new(r"\b[0-9a-f]{12,40}\b")
+    regex::Regex::new(r"\b[0-9a-f]{12,128}\b")
         .unwrap()
         .replace_all(&s, "[id]")
         .into_owned()
@@ -1780,21 +1794,81 @@ fn test_git_submodule_random_sequences() {
     }
 }
 
+fn load_sub_repo(work_dir: &TestWorkDir<'_>) -> Arc<ReadonlyRepo> {
+    RepoLoader::init_from_file_system(
+        &testutils::user_settings(),
+        &work_dir.root().join(".jj/repo/submodule_store/sub"),
+        &default_backend_factories(),
+    )
+    .unwrap()
+    .load_at_head()
+    .block_on()
+    .unwrap()
+}
+
+fn sub_commit(sub_repo: &ReadonlyRepo, hex: &str) -> Commit {
+    let id = CommitId::try_from_hex(hex).unwrap();
+    sub_repo.store().get_commit(&id).unwrap()
+}
+
+/// Snapshots the submodule directory into the submodule repo and commits the
+/// tree there: on top of `base`, or rewriting `base` if `amend`. Returns the
+/// new commit id.
+fn snapshot_submodule(work_dir: &TestWorkDir<'_>, base: &str, amend: bool) -> String {
+    let sub_repo = load_sub_repo(work_dir);
+    let settings = testutils::user_settings();
+    let mut state = TreeState::load(
+        sub_repo.store().clone(),
+        work_dir.root().join("sub"),
+        work_dir.root().join(".jj/working_copy/submodules/sub"),
+        &TreeStateSettings::try_from_user_settings(&settings).unwrap(),
+    )
+    .unwrap();
+    state
+        .snapshot(&testutils::empty_snapshot_options())
+        .block_on()
+        .unwrap();
+    state.save().unwrap();
+    let tree = state.current_tree().clone();
+    let base = sub_commit(&sub_repo, base);
+    let mut tx = sub_repo.start_transaction();
+    let builder = if amend {
+        tx.repo_mut().rewrite_commit(&base)
+    } else {
+        tx.repo_mut()
+            .new_commit(vec![base.id().clone()], tree.clone())
+    };
+    let commit = builder.set_tree(tree).write().block_on().unwrap();
+    tx.repo_mut().rebase_descendants().block_on().unwrap();
+    tx.commit("snapshot submodule working copy")
+        .block_on()
+        .unwrap();
+    commit.id().hex()
+}
+
+/// Rebases submodule commit `commit` onto `destination` in the submodule
+/// repo. Returns the new commit id.
+fn rebase_submodule(work_dir: &TestWorkDir<'_>, commit: &str, destination: &str) -> String {
+    let sub_repo = load_sub_repo(work_dir);
+    let commit = sub_commit(&sub_repo, commit);
+    let destination = sub_commit(&sub_repo, destination);
+    let mut tx = sub_repo.start_transaction();
+    let rebased = rebase_commit(tx.repo_mut(), commit, vec![destination.id().clone()])
+        .block_on()
+        .unwrap();
+    tx.repo_mut().rebase_descendants().block_on().unwrap();
+    tx.commit("rebase submodule working copy")
+        .block_on()
+        .unwrap();
+    rebased.id().hex()
+}
+
 /// Falsifier for snapshotting submodules (Phase 2): does by hand, through the
 /// library, what a superproject snapshot would do for a dirty submodule, and
 /// checks that checkout, Git and undo cope without any change to the op log
 /// or the backend.
 #[test]
 fn test_git_submodule_snapshot_by_hand() {
-    use jj_lib::backend::CommitId;
-    use jj_lib::default_backend_factories::default_backend_factories;
-    use jj_lib::local_working_copy::TreeState;
-    use jj_lib::local_working_copy::TreeStateSettings;
-    use jj_lib::object_id::ObjectId as _;
-    use jj_lib::repo::Repo as _;
-    use jj_lib::repo::RepoLoader;
-    use pollster::FutureExt as _;
-
     let test_env = TestEnvironment::default();
     let work_dir = set_up_superproject(&test_env);
     let submodule_dir = test_env.work_dir("submodule");
@@ -1810,56 +1884,11 @@ fn test_git_submodule_snapshot_by_hand() {
         .stdout
         .into_raw();
 
-    // Snapshots the submodule directory into the submodule repo and commits
-    // the tree there: on top of `base`, or rewriting `base` if `amend`.
-    let settings = testutils::user_settings();
-    let snapshot_submodule = |base: &str, amend: bool| -> String {
-        let sub_repo = RepoLoader::init_from_file_system(
-            &settings,
-            &work_dir.root().join(".jj/repo/submodule_store/sub"),
-            &default_backend_factories(),
-        )
-        .unwrap()
-        .load_at_head()
-        .block_on()
-        .unwrap();
-        let mut state = TreeState::load(
-            sub_repo.store().clone(),
-            sub_dir.clone(),
-            work_dir.root().join(".jj/working_copy/submodules/sub"),
-            &TreeStateSettings::try_from_user_settings(&settings).unwrap(),
-        )
-        .unwrap();
-        state
-            .snapshot(&testutils::empty_snapshot_options())
-            .block_on()
-            .unwrap();
-        state.save().unwrap();
-        let tree = state.current_tree().clone();
-        let base = sub_repo
-            .store()
-            .get_commit(&CommitId::try_from_hex(base).unwrap())
-            .unwrap();
-        let mut tx = sub_repo.start_transaction();
-        let builder = if amend {
-            tx.repo_mut().rewrite_commit(&base)
-        } else {
-            tx.repo_mut()
-                .new_commit(vec![base.id().clone()], tree.clone())
-        };
-        let commit = builder.set_tree(tree).write().block_on().unwrap();
-        tx.repo_mut().rebase_descendants().block_on().unwrap();
-        tx.commit("snapshot submodule working copy")
-            .block_on()
-            .unwrap();
-        commit.id().hex()
-    };
-
     // Not text, so any eol or encoding mangling on the way back would show.
     let added = b"\x00bin\r\n\xff";
     std::fs::write(sub_dir.join("sub"), "edited\n").unwrap();
     std::fs::write(sub_dir.join("added"), added).unwrap();
-    let first = snapshot_submodule(&gitlink, false);
+    let first = snapshot_submodule(&work_dir, &gitlink, false);
     let output = work_dir.run_jj(["git", "submodule", "set", "sub", &first]);
     insta::assert_snapshot!(output, @"
     ------- stderr -------
@@ -1935,7 +1964,7 @@ fn test_git_submodule_snapshot_by_hand() {
     // so undo has to check out a commit the submodule repo no longer shows.
     std::fs::write(sub_dir.join("sub"), "edited twice\n").unwrap();
     std::fs::remove_file(sub_dir.join("added")).unwrap();
-    let second = snapshot_submodule(&first, true);
+    let second = snapshot_submodule(&work_dir, &first, true);
     work_dir
         .run_jj(["git", "submodule", "set", "sub", &second])
         .success();
@@ -1962,6 +1991,173 @@ fn test_git_submodule_snapshot_by_hand() {
     ");
     assert_eq!(read("sub").unwrap(), b"edited twice\n");
     assert_eq!(read("added"), None);
+    let output = work_dir.run_jj(["status"]);
+    insta::assert_snapshot!(output, @"
+    Working copy changes:
+    M sub
+    Working copy  (@) : 
+    Parent commit (@-): Add submodule
+    [EOF]
+    ");
+}
+
+/// Falsifier for updating a submodule that has snapshotted local changes:
+/// rebases the snapshot commit onto a fetched upstream commit by hand, once
+/// cleanly and once with a conflict.
+#[test]
+fn test_git_submodule_rebase_by_hand() {
+    let test_env = TestEnvironment::default();
+    let work_dir = set_up_superproject(&test_env);
+    let submodule_dir = test_env.work_dir("submodule");
+    let sub_dir = work_dir.root().join("sub");
+    let read = |name: &str| std::fs::read_to_string(sub_dir.join(name)).ok();
+    // Commits `content` to `file` upstream, moves `main` there and fetches.
+    let upstream_commit = |file: &str, content: &str| -> String {
+        submodule_dir.write_file(file, content);
+        submodule_dir.run_jj(["commit", "-m", file]).success();
+        submodule_dir
+            .run_jj(["bookmark", "move", "main", "--to", "@-"])
+            .success();
+        work_dir.run_jj(["git", "submodule", "fetch"]).success();
+        submodule_dir
+            .run_jj(["log", "--no-graph", "-r", "main", "-T", "commit_id"])
+            .success()
+            .stdout
+            .into_raw()
+    };
+    let sub_log = |id: &str, template: &str| {
+        work_dir
+            .run_jj(["git", "submodule", "log", "sub", "-r", id, "-T", template])
+            .success()
+            .stdout
+            .into_raw()
+    };
+    work_dir
+        .run_jj(["git", "submodule", "clone", "sub"])
+        .success();
+    let gitlink = submodule_dir
+        .run_jj(["log", "--no-graph", "-r", "main", "-T", "commit_id"])
+        .success()
+        .stdout
+        .into_raw();
+    std::fs::write(sub_dir.join("sub"), "edited\n").unwrap();
+    let local = snapshot_submodule(&work_dir, &gitlink, false);
+    work_dir
+        .run_jj(["git", "submodule", "set", "sub", &local])
+        .success();
+
+    // Clean: upstream touched another file. The local edit is kept, the
+    // upstream file appears, and undo takes it away again.
+    let upstream = upstream_commit("other", "other\n");
+    let local = rebase_submodule(&work_dir, &local, &upstream);
+    let output = work_dir.run_jj(["git", "submodule", "set", "sub", &local]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Working copy  (@) now at: 
+    Parent commit (@-)      : Add submodule
+    Added 1 files, modified 1 files, removed 0 files
+    [EOF]
+    ");
+    assert_eq!(read("sub").unwrap(), "edited\n");
+    assert_eq!(read("other").unwrap(), "other\n");
+    let output = work_dir.run_jj(["undo"]).normalize_stderr_with(hide_ids);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Undid operation: [id] (2001-02-03 08:05:20) set submodule sub to [id] in commit [id]
+    Restored to operation: [id] (2001-02-03 08:05:15) set submodule sub to [id] in commit [id]
+    Working copy  (@) now at: 
+    Parent commit (@-)      : Add submodule
+    Added 0 files, modified 1 files, removed 1 files
+    [EOF]
+    ");
+    assert_eq!(read("sub").unwrap(), "edited\n");
+    assert_eq!(read("other"), None);
+    work_dir.run_jj(["redo"]).success();
+    assert_eq!(read("other").unwrap(), "other\n");
+
+    // Conflict: upstream changed the edited file. The conflicted commit sits
+    // behind the gitlink, readable by Git, and its markers are materialized
+    // in the submodule without making it look locally modified.
+    let upstream = upstream_commit("sub", "upstream\n");
+    let clean = local;
+    let conflicted = rebase_submodule(&work_dir, &clean, &upstream);
+    assert!(sub_log(&conflicted, "conflict").contains("true"));
+    let output = work_dir.run_jj(["git", "submodule", "set", "sub", &conflicted]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Working copy  (@) now at: 
+    Parent commit (@-)      : Add submodule
+    Added 0 files, modified 2 files, removed 0 files
+    [EOF]
+    ");
+    // The snapshot commit's id varies with the time it was written.
+    let markers = regex::Regex::new(r"\b[0-9a-f]{8}\b")
+        .unwrap()
+        .replace_all(&read("sub").unwrap(), "[id]")
+        .into_owned();
+    insta::assert_snapshot!(markers, @r#"
+    <<<<<<< conflict 1 of 1
+    +++++++ znkkpsqq [id] "sub" (rebase destination)
+    upstream
+    %%%%%%% diff from: rlvkpnrz [id] "other" (parents of rebased revision)
+    \\\\\\\        to: sryyqqkq [id] (rebased revision)
+    -sub
+    +edited
+    >>>>>>> conflict 1 of 1 ends
+    "#);
+    assert_eq!(read("other").unwrap(), "other\n");
+    let output = work_dir.run_jj(["status"]);
+    insta::assert_snapshot!(output, @"
+    Working copy changes:
+    M sub
+    Working copy  (@) : 
+    Parent commit (@-): Add submodule
+    [EOF]
+    ");
+    work_dir
+        .run_jj([
+            "util",
+            "exec",
+            "--",
+            "git",
+            "--git-dir",
+            ".jj/repo/submodule_store/sub/store/git",
+            "cat-file",
+            "-p",
+            &conflicted,
+        ])
+        .success();
+    // Undo goes back to the unconflicted files, redo to the markers.
+    let output = work_dir.run_jj(["undo"]).normalize_stderr_with(hide_ids);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Undid operation: [id] (2001-02-03 08:05:28) set submodule sub to [id] in commit [id]
+    Restored to operation: [id] (2001-02-03 08:05:22) redo: restore to operation [id]
+    Working copy  (@) now at: 
+    Parent commit (@-)      : Add submodule
+    Added 0 files, modified 2 files, removed 0 files
+    [EOF]
+    ");
+    assert_eq!(read("sub").unwrap(), "edited\n");
+    let output = work_dir.run_jj(["redo"]).normalize_stderr_with(hide_ids);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Restored to operation: [id] (2001-02-03 08:05:28) set submodule sub to [id] in commit [id]
+    Working copy  (@) now at: 
+    Parent commit (@-)      : Add submodule
+    Added 0 files, modified 2 files, removed 0 files
+    [EOF]
+    ");
+    assert!(read("sub").unwrap().contains("<<<<<<<"));
+
+    // Editing the markers away and snapshotting again resolves the commit.
+    std::fs::write(sub_dir.join("sub"), "resolved\n").unwrap();
+    let resolved = snapshot_submodule(&work_dir, &conflicted, true);
+    assert!(sub_log(&resolved, "conflict").contains("false"));
+    work_dir
+        .run_jj(["git", "submodule", "set", "sub", &resolved])
+        .success();
+    assert_eq!(read("sub").unwrap(), "resolved\n");
     let output = work_dir.run_jj(["status"]);
     insta::assert_snapshot!(output, @"
     Working copy changes:
