@@ -180,7 +180,8 @@ implemented in Phase 1:
   still missing are fetched by hash, which the remote may refuse. Relative
   `.gitmodules` URLs resolve against the superproject's `origin`, and URL
   changes in the working-copy commit's `.gitmodules` are followed on fetch.
-- Manual management: `jj git submodule clone|fetch|list|log|delete|populate|set`
+- Manual management:
+  `jj git submodule clone|fetch|list|log|delete|populate|set|rebase`
   (hidden while experimental). `set` points a gitlink at a commit already in
   the submodule store, given as a revset parsed in the superproject and
   resolved in the submodule repo; it also resolves a conflicted gitlink.
@@ -218,9 +219,25 @@ Implemented (experimental, `git.snapshot-submodules`):
 - Not done yet: the user's global ignores, auto-track patterns and
   `snapshot.max-new-file-size` don't apply inside submodules; nothing
   garbage-collects snapshot commits the superproject no longer refers to;
-  rebasing local submodule changes onto a new upstream commit and pushing
-  submodule commits have no command yet.
+  pushing submodule commits has no command yet.
 
 ### Merging/rebasing with submodules
 
-TODO
+Partly implemented: `jj git submodule rebase <name> --onto <revset>` updates
+a submodule that has local commits. It rebases the commits in
+`<onto>..<gitlink of @>` onto the destination in a transaction on the
+submodule repo and points the working-copy commit's gitlink at the result;
+with no such commits the gitlink just moves. Commits that are ancestors of a
+remote bookmark are never rebased. A conflict in the last commit is
+materialized in the submodule's files and resolved by editing them (the next
+snapshot rewrites the commit); `jj status` reports the submodule as having
+conflicts.
+
+Only the working-copy commit's gitlink follows the rewrite. Earlier
+superproject commits keep pointing at the pre-rebase submodule commits, so a
+rebase that would leave a conflict in an earlier submodule commit is refused:
+nothing could check that commit out to resolve it.
+
+TODO: make the superproject commits that refer to rewritten submodule commits
+follow them, and merge diverging gitlinks by merging/rebasing in the
+submodule instead of reporting a gitlink conflict.

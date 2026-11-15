@@ -188,7 +188,8 @@ and this project adheres to
   commit's files. `jj git submodule clone|fetch|list|delete|populate` manage
   the submodule store, `jj git submodule log` shows a submodule's history, and
   `jj git submodule set` points a gitlink at another submodule commit (also
-  resolving a conflicted gitlink). Submodules that
+  resolving a conflicted gitlink), and `jj git submodule rebase` moves local
+  submodule commits onto another one. Submodules that
   aren't cloned (or whose commit isn't fetched) are left as empty directories
   with a warning, and `jj status` lists them. Changes inside a submodule
   directory are snapshotted into a commit of the submodule, which the

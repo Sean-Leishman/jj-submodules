@@ -3615,13 +3615,18 @@ impl LockedWorkingCopy for LockedLocalWorkingCopy {
             return Ok(None);
         }
         // The cheap check first: usually nothing changed and nothing is read.
-        let mut maybe_dirty = vec![];
+        // It stats every file of every submodule on every command, hence in
+        // parallel.
+        let mut candidates = vec![];
         for path in populated {
             let disk_dir = path.to_fs_path(&self.wc.working_copy_path)?;
-            if nested_maybe_dirty(&self.submodule_state_path(&path), &disk_dir) {
-                maybe_dirty.push(path);
-            }
+            candidates.push((self.submodule_state_path(&path), disk_dir, path));
         }
+        let maybe_dirty: Vec<_> = candidates
+            .into_par_iter()
+            .filter(|(state_path, disk_dir, _)| nested_maybe_dirty(state_path, disk_dir))
+            .map(|(_, _, path)| path)
+            .collect();
         if maybe_dirty.is_empty() {
             return Ok(None);
         }

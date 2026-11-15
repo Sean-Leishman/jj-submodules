@@ -40,6 +40,11 @@ use jj_lib::repo::Repo as _;
 use jj_lib::repo_path::RepoPath;
 use jj_lib::repo_path::RepoPathBuf;
 use jj_lib::revset::RevsetExpression;
+use jj_lib::rewrite::MoveCommitsLocation;
+use jj_lib::rewrite::MoveCommitsTarget;
+use jj_lib::rewrite::RebaseOptions;
+use jj_lib::rewrite::RebasedCommit;
+use jj_lib::rewrite::move_commits;
 
 use crate::cli_util::CommandHelper;
 use crate::cli_util::LogContentFormat;
@@ -73,6 +78,7 @@ pub enum GitSubmoduleCommand {
     Log(SubmoduleLogArgs),
     Populate(SubmodulePopulateArgs),
     PrintGitmodules(SubmodulePrintGitmodulesArgs),
+    Rebase(SubmoduleRebaseArgs),
     Set(SubmoduleSetArgs),
 }
 
@@ -150,6 +156,28 @@ pub struct SubmodulePrintGitmodulesArgs {
     revision: RevisionArg,
 }
 
+/// Move a submodule's local commits onto another commit of the submodule
+///
+/// Rebases the submodule commits that lead up to the working-copy commit's
+/// gitlink and aren't ancestors of the destination (typically snapshots of
+/// changes made in the submodule's directory) onto the destination, and
+/// points the gitlink at the result. Without such commits, the gitlink just
+/// moves to the destination. Commits that are on a remote are not rebased.
+#[derive(clap::Args, Clone, Debug)]
+pub struct SubmoduleRebaseArgs {
+    /// Name of the submodule
+    name: String,
+    /// Revision in the submodule repo to rebase onto
+    #[arg(
+        long,
+        visible_alias = "destination",
+        short,
+        visible_short_alias = 'd',
+        value_name = "SUBMODULE_REVSET"
+    )]
+    onto: RevisionArg,
+}
+
 /// Point a submodule's gitlink at a commit of the submodule
 ///
 /// Rewrites the superproject commit so the submodule's path refers to the
@@ -179,6 +207,7 @@ pub async fn cmd_git_submodule(
         GitSubmoduleCommand::List(args) => cmd_submodule_list(ui, command, args).await,
         GitSubmoduleCommand::Log(args) => cmd_submodule_log(ui, command, args).await,
         GitSubmoduleCommand::Populate(args) => cmd_submodule_populate(ui, command, args).await,
+        GitSubmoduleCommand::Rebase(args) => cmd_submodule_rebase(ui, command, args).await,
         GitSubmoduleCommand::Set(args) => cmd_submodule_set(ui, command, args).await,
         GitSubmoduleCommand::PrintGitmodules(args) => {
             cmd_submodule_print_gitmodules(ui, command, args).await
@@ -369,20 +398,12 @@ async fn cmd_submodule_delete(
     // Snapshots of local changes exist nowhere but in the submodule repo.
     if !args.force {
         let local_only = "visible_heads() ~ ::remote_bookmarks() ~ root()";
-        let expression = workspace_command
-            .parse_revset(ui, &RevisionArg::from(local_only.to_owned()))?
-            .expression()
-            .clone();
         for name in &args.names {
             let sub_repo = load_submodule(&repo, name).await?;
-            let id_prefix_context = IdPrefixContext::default();
-            let evaluator = RevsetExpressionEvaluator::new(
-                sub_repo.as_ref(),
-                command.revset_extensions().clone(),
-                &id_prefix_context,
-                expression.clone(),
-            );
-            if !evaluator.evaluate()?.is_empty()? {
+            let revision = RevisionArg::from(local_only.to_owned());
+            let ids =
+                submodule_revset(ui, command, &workspace_command, &sub_repo, &revision).await?;
+            if !ids.is_empty() {
                 return Err(user_error(format!(
                     "Submodule {name:?} has commits that are on none of its remotes"
                 ))
@@ -537,8 +558,8 @@ pub(crate) async fn fetch_stored_submodules(
 }
 
 /// Submodules of `wc_commit` that need attention, as `(path, problem)`:
-/// not cloned, gitlink commit not fetched, or local changes that aren't
-/// snapshotted.
+/// not cloned, gitlink commit not fetched, conflicted, or local changes that
+/// aren't snapshotted.
 pub(crate) async fn submodule_status(
     workspace_command: &mut WorkspaceCommandHelper,
     wc_commit: &Commit,
@@ -573,6 +594,7 @@ pub(crate) async fn submodule_status(
                 {
                     "has submodules of its own, which jj doesn't populate yet".to_owned()
                 }
+                Ok(commit) if commit.has_conflict() => "has conflicts".to_owned(),
                 Ok(_) => continue,
             },
         };
@@ -650,31 +672,142 @@ async fn cmd_submodule_set(
         )));
     };
     let sub_repo = load_submodule(&repo, &args.name).await?;
-    // Parsed with the superproject's aliases, resolved in the submodule repo.
-    let expression = workspace_command
-        .parse_revset(ui, &args.submodule_revision)?
-        .expression()
-        .clone();
-    let id_prefix_context = IdPrefixContext::default();
-    let evaluator = RevsetExpressionEvaluator::new(
-        sub_repo.as_ref(),
-        command.revset_extensions().clone(),
-        &id_prefix_context,
-        expression,
-    );
-    let ids: Vec<CommitId> = evaluator
-        .evaluate_to_commit_ids()?
-        .take(2)
-        .try_collect()
+    let sub_commit_id = submodule_single_commit(
+        ui,
+        command,
+        &workspace_command,
+        &sub_repo,
+        &args.name,
+        &args.submodule_revision,
+    )
+    .await?;
+    set_gitlink(ui, &mut workspace_command, &commit, config, &sub_commit_id).await
+}
+
+async fn cmd_submodule_rebase(
+    ui: &mut Ui,
+    command: &CommandHelper,
+    args: &SubmoduleRebaseArgs,
+) -> Result<(), CommandError> {
+    let name = &args.name;
+    let mut workspace_command = command.workspace_helper(ui).await?;
+    let commit = workspace_command
+        .resolve_single_rev(ui, &RevisionArg::AT)
         .await?;
-    let [sub_commit_id] = ids.as_slice() else {
+    workspace_command.check_rewritable([commit.id()]).await?;
+    let repo = workspace_command.repo().clone();
+    let submodules = git_submodule::read_gitmodules(repo.store(), &commit.tree()).await?;
+    let Some(config) = submodules.get(name) else {
         return Err(user_error(format!(
-            "Revset {:?} must resolve to exactly one commit in submodule {:?}",
-            args.submodule_revision.as_ref(),
-            args.name
+            "Submodule {name:?} is not declared in .gitmodules"
         )));
     };
+    let Some(old_id) = git_submodule::submodule_gitlinks(&commit.tree(), &submodules)
+        .await?
+        .remove(name)
+    else {
+        return Err(user_error(format!(
+            "Submodule {name:?} has no resolved gitlink in the working-copy commit"
+        )));
+    };
+    let sub_repo = load_submodule(&repo, name).await?;
+    let onto_id =
+        submodule_single_commit(ui, command, &workspace_command, &sub_repo, name, &args.onto)
+            .await?;
+    let (old, onto) = (old_id.hex(), onto_id.hex());
+    let evaluate = async |revset: String| {
+        let revision = RevisionArg::from(revset);
+        submodule_revset(ui, command, &workspace_command, &sub_repo, &revision).await
+    };
+    // Commits fetched by hash are in the store but in no revset.
+    if evaluate(format!("present({old})")).await?.is_empty() {
+        return Err(user_error(format!(
+            "Commit {old} is not in the history of submodule {name:?}"
+        ))
+        .hinted(format!(
+            "`jj git submodule set {name}` can point the gitlink at another commit."
+        )));
+    }
+    let roots = evaluate(format!("roots({onto}..{old})")).await?;
+    let new_id = if roots.is_empty() {
+        // Nothing local: the old commit is the destination or an ancestor.
+        onto_id
+    } else {
+        if !evaluate(format!("({onto}..{old}) & ::remote_bookmarks()"))
+            .await?
+            .is_empty()
+        {
+            return Err(user_error(format!(
+                "Commits of submodule {name:?} that are on a remote would be rebased"
+            ))
+            .hinted(format!(
+                "`jj git submodule set {name}` can point the gitlink at another commit."
+            )));
+        }
+        let mut tx = sub_repo.start_transaction();
+        let stats = move_commits(
+            tx.repo_mut(),
+            &MoveCommitsLocation {
+                new_parent_ids: vec![onto_id],
+                new_child_ids: vec![],
+                target: MoveCommitsTarget::Roots(roots),
+            },
+            &RebaseOptions::default(),
+        )
+        .await?;
+        tx.repo_mut().rebase_descendants().await?;
+        let new_id = match stats.rebased_commits.get(&old_id) {
+            Some(RebasedCommit::Rewritten(commit)) => commit.id().clone(),
+            Some(RebasedCommit::Abandoned { parent_id }) => parent_id.clone(),
+            None => old_id.clone(),
+        };
+        // ponytail: only the tip is checked out, so only its conflicts can be
+        // resolved. Lifting this needs the superproject commits that refer
+        // to the earlier submodule commits to follow the rewrite.
+        let stuck = stats.rebased_commits.values().any(|rebased| match rebased {
+            RebasedCommit::Rewritten(commit) => commit.id() != &new_id && commit.has_conflict(),
+            RebasedCommit::Abandoned { .. } => false,
+        });
+        if stuck {
+            return Err(user_error(format!(
+                "Rebasing would leave conflicts in earlier commits of submodule {name:?}, which \
+                 can't be resolved yet"
+            )));
+        }
+        if tx.repo().has_changes() {
+            tx.commit(format!("rebase submodule commits onto {onto}"))
+                .await?;
+        }
+        writeln!(
+            ui.status(),
+            "Rebased {} commits of submodule {name:?}",
+            stats.num_rebased_targets + stats.num_rebased_descendants
+        )?;
+        new_id
+    };
+    if new_id == old_id {
+        writeln!(ui.status(), "Nothing changed.")?;
+        return Ok(());
+    }
+    set_gitlink(ui, &mut workspace_command, &commit, config, &new_id).await?;
+    if sub_repo.store().get_commit(&new_id)?.has_conflict() {
+        writeln!(
+            ui.warning_default(),
+            "Submodule {name:?} now has conflicts; resolve them in its files."
+        )?;
+    }
+    Ok(())
+}
 
+/// Rewrites `commit` so the gitlink of submodule `config` points at
+/// `sub_commit_id`.
+async fn set_gitlink(
+    ui: &Ui,
+    workspace_command: &mut WorkspaceCommandHelper,
+    commit: &Commit,
+    config: &SubmoduleConfig,
+    sub_commit_id: &CommitId,
+) -> Result<(), CommandError> {
     let mut tx = workspace_command.start_transaction();
     let mut tree_builder = MergedTreeBuilder::new(commit.tree());
     tree_builder.set_or_remove(
@@ -683,7 +816,7 @@ async fn cmd_submodule_set(
     );
     let new_tree = tree_builder.write_tree().await?;
     tx.repo_mut()
-        .rewrite_commit(&commit)
+        .rewrite_commit(commit)
         .set_tree(new_tree)
         .write()
         .await?;
@@ -691,12 +824,54 @@ async fn cmd_submodule_set(
         ui,
         format!(
             "set submodule {} to {} in commit {}",
-            args.name,
+            config.name,
             sub_commit_id.hex(),
             commit.id().hex()
         ),
     )
     .await
+}
+
+/// Evaluates `revision` in the submodule repo. It is parsed with the
+/// superproject's aliases; its symbols resolve in the submodule repo, which
+/// has remote bookmarks (`main@origin`) but no local ones.
+async fn submodule_revset(
+    ui: &Ui,
+    command: &CommandHelper,
+    workspace_command: &WorkspaceCommandHelper,
+    sub_repo: &ReadonlyRepo,
+    revision: &RevisionArg,
+) -> Result<Vec<CommitId>, CommandError> {
+    let expression = workspace_command
+        .parse_revset(ui, revision)?
+        .expression()
+        .clone();
+    let id_prefix_context = IdPrefixContext::default();
+    let evaluator = RevsetExpressionEvaluator::new(
+        sub_repo,
+        command.revset_extensions().clone(),
+        &id_prefix_context,
+        expression,
+    );
+    Ok(evaluator.evaluate_to_commit_ids()?.try_collect().await?)
+}
+
+async fn submodule_single_commit(
+    ui: &Ui,
+    command: &CommandHelper,
+    workspace_command: &WorkspaceCommandHelper,
+    sub_repo: &ReadonlyRepo,
+    name: &str,
+    revision: &RevisionArg,
+) -> Result<CommitId, CommandError> {
+    let ids = submodule_revset(ui, command, workspace_command, sub_repo, revision).await?;
+    let Ok([id]) = <[CommitId; 1]>::try_from(ids) else {
+        return Err(user_error(format!(
+            "Revset {:?} must resolve to exactly one commit in submodule {name:?}",
+            revision.as_ref(),
+        )));
+    };
+    Ok(id)
 }
 
 async fn load_submodule(

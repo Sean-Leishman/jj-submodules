@@ -452,3 +452,41 @@ loading anything), load stores lazily, and run nested snapshots in parallel.
   incremental `cargo check` of jj-lib, twice. `rm -rf
   target/debug/incremental/jj_lib-*` fixes it; `cargo clean -p jj-lib` also
   does but deleted 26 GB across all profiles.
+
+### 2026-11-15 — Phase 2, step 2: per-command cost on bat; `jj git submodule rebase`
+
+- Timing on bat (94 populated submodules, 8304 files, tmpfs, dev profile at
+  opt-level 3, `jj log -r @`, A/B via `--config git.snapshot-submodules=`):
+  with the `nested_maybe_dirty` walk serial, snapshots on cost +36 ms per
+  command when nothing changed (52 → 89 ms mean). Running the walk with
+  rayon across submodules brings that to roughly +10 ms (min 40-44 ms off vs
+  51-53 ms on). The machine was loaded (load avg 5-6) for the second
+  measurement, so medians overlap and only the minimums are trustworthy;
+  re-measure on a quiet machine before quoting it upstream. Touching every
+  submodule dir (forces a full nested snapshot of all 94, serial): ~+50-60
+  ms. One dirty submodule (sub commit + superproject snapshot op): not
+  distinguishable from clean. Verdict: not killed.
+- `jj git submodule rebase <name> --onto/-d <submodule revset>`: rebases
+  `<onto>..<gitlink of @>` (the local commits) with `move_commits` in a
+  submodule transaction, then moves `@`'s gitlink (shared `set_gitlink` with
+  `set`). No local commits → the gitlink just moves (fast-forward). Refuses
+  to rebase anything that is an ancestor of a remote bookmark. The submodule
+  repo's wc pointer follows the rewrite, so later edits still amend.
+- Hard limit found while writing it: only `@`'s gitlink follows a submodule
+  rewrite. Earlier superproject commits keep the pre-rebase gitlinks, and
+  only the tip submodule commit is ever checked out, so a conflict in an
+  earlier local submodule commit could never be resolved. The rebase is
+  refused in that case rather than creating it. The real fix is the open
+  "merging/rebasing with submodules" design: superproject commits that refer
+  to rewritten submodule commits must follow, and diverging gitlinks should
+  merge in the submodule. That one probably does belong in the #494 thread.
+- `jj status` lists a submodule whose gitlinked commit is conflicted ("has
+  conflicts"); rebase warns when its result is conflicted.
+- `move_commits` must be followed by `rebase_descendants()` or
+  `Transaction::commit` panics ("Descendants have not been rebased").
+- By-hand falsifier tests replaced by `test_git_submodule_snapshot` and
+  `test_git_submodule_rebase`; no library calls left in the CLI test file.
+- Verified on 1.97.1: 1161 CLI tests, 95 lib working-copy tests. Optimized
+  bench binary kept in `target/opt` (build: `CARGO_PROFILE_DEV_OPT_LEVEL=3
+  CARGO_PROFILE_DEV_DEBUG=0 cargo build -p jj-cli --target-dir target/opt
+  -j4`, 9 min cold).
