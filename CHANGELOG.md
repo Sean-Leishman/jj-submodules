@@ -191,8 +191,10 @@ and this project adheres to
   resolving a conflicted gitlink). Submodules that
   aren't cloned (or whose commit isn't fetched) are left as empty directories
   with a warning, and `jj status` lists them. Changes inside a submodule
-  directory are still not snapshotted, but a submodule with local changes is
-  never overwritten or removed by a checkout.
+  directory are snapshotted into a commit of the submodule, which the
+  working-copy commit then points at (`git.snapshot-submodules`); a submodule
+  with local changes that aren't snapshotted is never overwritten or removed
+  by a checkout.
   [#494](https://github.com/jj-vcs/jj/issues/494)
 
 ### Fixed bugs

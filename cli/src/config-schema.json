@@ -560,6 +560,11 @@
                     "description": "Whether `jj git fetch` also fetches cloned Git submodules (experimental)",
                     "default": true
                 },
+                "snapshot-submodules": {
+                    "type": "boolean",
+                    "description": "Whether changes made inside populated Git submodules are snapshotted into commits of the submodule (experimental)",
+                    "default": true
+                },
                 "write-change-id-header": {
                     "type": "boolean",
                     "description": "Whether the change id should be stored in the Git commit object",

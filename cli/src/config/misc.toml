@@ -32,6 +32,7 @@ sign-on-push = false
 track-default-bookmark-on-clone = true
 clone-submodules = true
 fetch-submodules = true
+snapshot-submodules = true
 
 [ui]
 color = "auto"

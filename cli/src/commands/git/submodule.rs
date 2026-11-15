@@ -96,6 +96,9 @@ pub struct SubmoduleDeleteArgs {
     /// Names of the submodules to delete
     #[arg(required = true)]
     names: Vec<String>,
+    /// Delete even submodules with commits that are on no remote
+    #[arg(long)]
+    force: bool,
 }
 
 /// Fetch all branches and tags of cloned submodules from their remotes
@@ -363,6 +366,33 @@ async fn cmd_submodule_delete(
             return Err(GitSubmoduleError::NotCloned(name.clone()).into());
         }
     }
+    // Snapshots of local changes exist nowhere but in the submodule repo.
+    if !args.force {
+        let local_only = "visible_heads() ~ ::remote_bookmarks() ~ root()";
+        let expression = workspace_command
+            .parse_revset(ui, &RevisionArg::from(local_only.to_owned()))?
+            .expression()
+            .clone();
+        for name in &args.names {
+            let sub_repo = load_submodule(&repo, name).await?;
+            let id_prefix_context = IdPrefixContext::default();
+            let evaluator = RevsetExpressionEvaluator::new(
+                sub_repo.as_ref(),
+                command.revset_extensions().clone(),
+                &id_prefix_context,
+                expression.clone(),
+            );
+            if !evaluator.evaluate()?.is_empty()? {
+                return Err(user_error(format!(
+                    "Submodule {name:?} has commits that are on none of its remotes"
+                ))
+                .hinted(format!(
+                    "See them with `jj git submodule log {name} -r '{local_only}'`; `--force` \
+                     deletes them."
+                )));
+            }
+        }
+    }
     // Empty the submodule directories while their repo can still be read.
     let (mut locked_ws, wc_commit) = workspace_command.start_working_copy_mutation().await?;
     let declared = git_submodule::read_gitmodules(repo.store(), &wc_commit.tree()).await?;
@@ -507,7 +537,8 @@ pub(crate) async fn fetch_stored_submodules(
 }
 
 /// Submodules of `wc_commit` that need attention, as `(path, problem)`:
-/// not cloned, gitlink commit not fetched, or local changes jj doesn't record.
+/// not cloned, gitlink commit not fetched, or local changes that aren't
+/// snapshotted.
 pub(crate) async fn submodule_status(
     workspace_command: &mut WorkspaceCommandHelper,
     wc_commit: &Commit,
@@ -561,12 +592,11 @@ pub(crate) async fn submodule_status(
         .map_err(|err| internal_error_with_message("Failed to inspect submodules", err))?;
     // Dropped unfinished: nothing was changed.
     drop(locked_ws);
-    problems.extend(dirty.into_iter().map(|path| {
-        (
-            path,
-            "has local changes, which jj does not record yet".to_owned(),
-        )
-    }));
+    problems.extend(
+        dirty
+            .into_iter()
+            .map(|path| (path, "has local changes that aren't snapshotted".to_owned())),
+    );
     problems.sort();
     Ok(problems)
 }

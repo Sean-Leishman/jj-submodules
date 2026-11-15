@@ -2134,6 +2134,11 @@ to the current parents may contain changes from multiple commits.
             .snapshot_options_with_start_tracking_matcher(&auto_tracking_matcher)
             .map_err(snapshot_command_error)?;
 
+        let snapshot_submodules = self
+            .settings()
+            .get_bool("git.snapshot-submodules")
+            .map_err(snapshot_command_error)?;
+
         // Compare working-copy tree and operation with repo's, and reload as needed.
         let mut locked_ws = self
             .workspace
@@ -2159,6 +2164,16 @@ to the current parents may contain changes from multiple commits.
                 .snapshot(&options)
                 .await
                 .map_err(snapshot_command_error)?
+        };
+        let new_tree = if snapshot_submodules {
+            locked_ws
+                .locked_wc()
+                .snapshot_submodules(&wc_commit)
+                .await
+                .map_err(snapshot_command_error)?
+                .unwrap_or(new_tree)
+        } else {
+            new_tree
         };
         if new_tree.tree_ids_and_labels() != wc_commit.tree().tree_ids_and_labels() {
             let mut tx = start_repo_transaction(

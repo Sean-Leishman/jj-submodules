@@ -2026,10 +2026,22 @@ clone-submodules = false
 fetch-submodules = false
 ```
 
-Submodules can then be managed manually with `jj git submodule`. Changes made
-inside a submodule directory are not snapshotted yet; a submodule with local
-changes is left alone by checkouts. `jj status` lists submodules that are not
-cloned, whose commit is not fetched, or that have local changes.
+Submodules can then be managed manually with `jj git submodule`.
+
+Changes made inside a populated submodule directory are snapshotted like the
+rest of the working copy: they become a commit in the submodule's repo, and
+the working-copy commit records that commit for the submodule. The submodule
+commit is rewritten by later snapshots until a parent of the working-copy
+commit refers to it. To leave submodule directories alone instead:
+
+```toml
+[git]
+snapshot-submodules = false
+```
+
+A submodule with local changes that aren't snapshotted is never overwritten
+by a checkout. `jj status` lists submodules that are not cloned, whose commit
+is not fetched, or that have such changes.
 
 ### Abandon commits that became unreachable in Git
 

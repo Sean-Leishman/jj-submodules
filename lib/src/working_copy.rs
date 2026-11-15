@@ -139,6 +139,18 @@ pub trait LockedWorkingCopy: Any + Send {
         Ok(vec![])
     }
 
+    /// Commits the local changes of populated Git submodules in their own
+    /// repos and moves the gitlinks in the working-copy tree to the new
+    /// commits. A submodule commit is rewritten in place only if an earlier
+    /// call created it and no parent of `wc_commit` refers to it. Returns the
+    /// new working-copy tree, or `None` if no gitlink moved.
+    async fn snapshot_submodules(
+        &mut self,
+        _wc_commit: &Commit,
+    ) -> Result<Option<MergedTree>, SnapshotError> {
+        Ok(None)
+    }
+
     /// Removes the populated contents of the Git submodule at `path`.
     async fn clear_submodule(&mut self, _path: &RepoPath) -> Result<CheckoutStats, CheckoutError> {
         Ok(CheckoutStats::default())

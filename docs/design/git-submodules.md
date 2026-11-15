@@ -167,9 +167,9 @@ implemented in Phase 1:
   are never snapshotted as new superproject files), and the ones in the new
   tree are populated after it. The superproject tree state never descends
   into submodule directories.
-- A populated submodule with local changes (detected by a throwaway snapshot
-  against the submodule's own store, honoring its `.gitignore`s) is never
-  clobbered. Its directory is left alone with a warning, and the gitlink it
+- A populated submodule with local changes that aren't snapshotted (see
+  below; detected by a throwaway snapshot against the submodule's own store,
+  honoring its `.gitignore`s) is never clobbered. Its directory is left alone with a warning, and the gitlink it
   currently corresponds to is kept in the tree that gets checked out, so the
   working-copy commit shows the submodule as modified relative to its parent,
   the way `git status` reports a dirty submodule. Once the changes are undone
@@ -188,13 +188,38 @@ implemented in Phase 1:
   in a submodule counts as immutable, since the superproject's
   `immutable_heads()` names bookmarks the submodule doesn't have.
 - `jj status` lists submodules that aren't cloned, whose commit isn't fetched,
-  or that have local changes.
+  or that have local changes that aren't snapshotted.
 
 ### Snapshotting new submodule changes
 
-TODO. The per-submodule tree state described above is the intended hook:
-snapshotting a submodule directory would snapshot into the submodule repo and
-update the superproject gitlink.
+Implemented (experimental, `git.snapshot-submodules`):
+
+- After the superproject snapshot, each populated submodule whose directory
+  may have changed is snapshotted through its own tree state into the
+  submodule repo's store. If its tree changed, a commit is written in a
+  transaction on the submodule repo and the gitlink in the working-copy tree
+  moves to it, so the superproject's "snapshot working copy" operation
+  records the new gitlink. This needs nothing new from the operation log or
+  the backend: the two repos' operations are not tied together, and undoing
+  in the superproject just checks out the older gitlink.
+- The submodule repo records the commit as the working-copy commit of the
+  superproject's workspace (in its own view). The next snapshot rewrites it
+  in place if the gitlink still points at it and no parent of the
+  superproject's working-copy commit refers to it; otherwise it creates a
+  child. Upstream commits and commits the superproject's history refers to
+  are therefore never rewritten.
+- A submodule is only snapshotted if its directory was populated from the
+  commit the gitlink points at. If the gitlink moved while the directory
+  couldn't follow, the changes stay unsnapshotted and protected as before.
+- Submodule tree states are saved together with the superproject's, so a
+  snapshot whose superproject operation doesn't complete is redone.
+- `jj git submodule delete` refuses (without `--force`) to delete a repo with
+  commits that are on none of its remotes.
+- Not done yet: the user's global ignores, auto-track patterns and
+  `snapshot.max-new-file-size` don't apply inside submodules; nothing
+  garbage-collects snapshot commits the superproject no longer refers to;
+  rebasing local submodule changes onto a new upstream commit and pushing
+  submodule commits have no command yet.
 
 ### Merging/rebasing with submodules
 

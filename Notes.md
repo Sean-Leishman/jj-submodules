@@ -404,3 +404,51 @@ loading anything), load stores lazily, and run nested snapshots in parallel.
   "redo: restore to operation ..." leaked into a snapshot; widened to 128.
   Commits written from the test process get wall-clock timestamps, so their
   ids must never reach a snapshot.
+
+### 2026-11-15 — Phase 2, step 1: submodule changes are snapshotted
+
+- New default-no-op `LockedWorkingCopy::snapshot_submodules(wc_commit)`,
+  called by the CLI's `snapshot_working_copy` right after the superproject
+  snapshot. Local impl: per populated submodule that `nested_maybe_dirty`
+  flags, snapshot the nested tree state, commit the tree in a submodule-repo
+  transaction, move the gitlink in the superproject tree state. The other
+  snapshot call sites (`file track/untrack`, `run`, `workspace remove`) don't
+  call it; submodule edits just wait for the next ordinary command.
+- Amend-or-child rule: the submodule repo's own view records the snapshot
+  commit as the wc commit of the superproject's workspace name. Rewrite it
+  iff the gitlink still equals that pointer AND no parent of the superproject
+  `@` has that gitlink; else new child. So upstream commits and commits the
+  superproject history refers to are never rewritten. Rejected: inferring
+  "mutable" from remote bookmarks (commits fetched by hash are on no
+  bookmark and would have been amended). Bonus: `submodule log` shows `@`.
+- Only snapshot when the nested state's tree equals the gitlink commit's
+  tree; otherwise (gitlink moved while the dir couldn't follow) the diff
+  isn't just local changes, so it stays unsnapshotted and protected.
+- Nested states of snapshotted submodules are saved in `finish()` with the
+  superproject's, so an unfinished superproject snapshot is redone (cost: an
+  orphan submodule commit).
+- The per-submodule function is sync with `block_on`: `Transaction` isn't
+  `Send` and the trait is `#[async_trait]`.
+- Config `git.snapshot-submodules` (default true). Besides being an opt-out,
+  it is how the Phase 1 "never clobber unsnapshotted changes" tests keep
+  reaching that state: five of them set it to false and only changed wording.
+  The random-sequence test runs in both modes; with snapshots on the
+  invariant is "on disk or in some commit of the submodule repo".
+- `jj git submodule delete` refuses when the repo has visible heads on no
+  remote (the snapshot commits exist nowhere else); `--force` overrides and
+  skips loading the repo.
+- Known gaps: global ignores / auto-track / max-new-file-size don't apply in
+  submodules; snapshot commits the superproject dropped stay visible heads
+  forever (no gc, and they keep `delete` asking for `--force`); editing after
+  an undo to an amended-away commit creates a child of that hidden commit;
+  a submodule repo that fails to load makes every snapshotting command fail
+  (escape: `--config git.snapshot-submodules=false`); in a colocated repo
+  `git status` shows nothing for the moved gitlink.
+- Verified on 1.97.1: 1161 CLI tests, 95 lib working-copy tests,
+  `--no-default-features` check (only the 3 upstream warnings). NOT measured:
+  per-command cost on bat (the gate walks every submodule dir each command).
+  Clippy still not installed.
+- Build gotcha: rustc ICE "unstable fingerprints for evaluate_obligation" in
+  incremental `cargo check` of jj-lib, twice. `rm -rf
+  target/debug/incremental/jj_lib-*` fixes it; `cargo clean -p jj-lib` also
+  does but deleted 26 GB across all profiles.

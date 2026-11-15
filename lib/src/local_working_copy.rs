@@ -2789,6 +2789,7 @@ impl WorkingCopy for LocalWorkingCopy {
             old_operation_id,
             old_tree,
             tree_state_dirty: false,
+            snapshotted_submodule_states: vec![],
             new_workspace_name: None,
             _lock: lock,
         }))
@@ -2972,6 +2973,9 @@ pub struct LockedLocalWorkingCopy {
     old_operation_id: OperationId,
     old_tree: MergedTree,
     tree_state_dirty: bool,
+    /// Tree states of submodules snapshotted under this lock. Saved together
+    /// with the superproject's, so a snapshot that isn't finished is redone.
+    snapshotted_submodule_states: Vec<TreeState>,
     new_workspace_name: Option<WorkspaceNameBuf>,
     _lock: FileLock,
 }
@@ -3035,6 +3039,22 @@ async fn gitmodules_by_path(store: &Store, tree: &MergedTree) -> HashMap<RepoPat
     }
 }
 
+/// How submodule directories are snapshotted, for the dirty check and for
+/// real alike (they have to agree on what counts as a change).
+// ponytail: only the submodule's own `.gitignore`s apply; the user's global
+// ignores, auto-track patterns and `snapshot.max-new-file-size` don't. Thread
+// the superproject's SnapshotOptions through checkout too if that bites.
+#[cfg(feature = "git")]
+fn nested_snapshot_options() -> SnapshotOptions<'static> {
+    SnapshotOptions {
+        base_ignores: GitIgnoreFile::empty(),
+        progress: None,
+        start_tracking_matcher: &EverythingMatcher,
+        force_tracking_matcher: &NothingMatcher,
+        max_new_file_size: u64::MAX,
+    }
+}
+
 /// Whether the populated submodule has uncommitted changes (modified, added
 /// or deleted files, honoring the submodule's own `.gitignore`s). Nothing is
 /// snapshotted for real; the tree state isn't saved.
@@ -3044,13 +3064,7 @@ fn nested_is_dirty(state: &mut TreeState) -> Result<bool, CheckoutError> {
     if !state.working_copy_path().is_dir() {
         return Ok(true);
     }
-    let options = SnapshotOptions {
-        base_ignores: GitIgnoreFile::empty(),
-        progress: None,
-        start_tracking_matcher: &EverythingMatcher,
-        force_tracking_matcher: &NothingMatcher,
-        max_new_file_size: u64::MAX,
-    };
+    let options = nested_snapshot_options();
     let before = {
         let (ids, labels) = state.current_tree().tree_ids_and_labels();
         (ids.clone(), labels.clone())
@@ -3119,7 +3133,7 @@ fn nested_maybe_dirty(state_path: &Path, dir: &Path) -> bool {
 
 #[cfg(feature = "git")]
 const DIRTY_SUBMODULE: &str =
-    "it has local changes, which jj cannot snapshot yet; the directory was left as is";
+    "it has local changes that aren't snapshotted; the directory was left as is";
 #[cfg(feature = "git")]
 const NESTED_SUBMODULES: &str = "it has submodules of its own, which jj doesn't populate yet";
 #[cfg(feature = "git")]
@@ -3374,6 +3388,106 @@ impl LockedLocalWorkingCopy {
     }
 }
 
+/// Snapshotting submodule directories: local changes become a commit in the
+/// submodule repo and the superproject's gitlink moves to it. Each submodule
+/// repo records that commit as the working-copy commit of the superproject's
+/// workspace, which is how the next snapshot knows it may rewrite it.
+#[cfg(feature = "git")]
+impl LockedLocalWorkingCopy {
+    /// Returns the id of the commit now holding the contents of the submodule
+    /// directory at `path`, or `None` if there is nothing to snapshot or the
+    /// submodule can't be snapshotted (it then stays dirty).
+    // Not async: submodule repo transactions aren't `Send`.
+    fn snapshot_submodule_at(
+        &mut self,
+        path: &RepoPath,
+        name: &str,
+        gitlink: &CommitId,
+        wc_commit: &Commit,
+    ) -> Result<Option<CommitId>, SnapshotError> {
+        fn error(path: &RepoPath, err: impl Into<Box<dyn Error + Send + Sync>>) -> SnapshotError {
+            SnapshotError::Other {
+                message: format!(
+                    "Failed to snapshot submodule at {}",
+                    path.as_internal_file_string()
+                ),
+                err: err.into(),
+            }
+        }
+        let Some(loader) = self
+            .wc
+            .submodule_store
+            .load_repo(name)
+            .map_err(|err| error(path, err))?
+        else {
+            return Ok(None);
+        };
+        let mut state = self
+            .nested_tree_state(loader.store().clone(), path)
+            .map_err(|err| error(path, err))?;
+        if state.file_states().is_empty() || !state.working_copy_path().is_dir() {
+            return Ok(None);
+        }
+        let base = match loader.store().get_commit(gitlink) {
+            Ok(commit) => commit,
+            Err(BackendError::ObjectNotFound { .. }) => return Ok(None),
+            Err(err) => return Err(err.into()),
+        };
+        let base_tree = base.tree();
+        // The directory holds another commit's files (the gitlink moved while
+        // the submodule couldn't follow): what differs from the gitlink isn't
+        // only local changes.
+        if state.current_tree().tree_ids_and_labels() != base_tree.tree_ids_and_labels() {
+            return Ok(None);
+        }
+        state.snapshot(&nested_snapshot_options()).block_on()?;
+        let tree = state.current_tree().clone();
+        if tree.tree_ids_and_labels() == base_tree.tree_ids_and_labels() {
+            // Same tree, refreshed file states: saving moves the state's
+            // mtime past files written in the same clock tick, so the next
+            // nested_maybe_dirty() can skip this submodule.
+            state.save().map_err(|err| error(path, err))?;
+            return Ok(None);
+        }
+
+        let sub_repo = loader
+            .load_at_head()
+            .block_on()
+            .map_err(|err| error(path, err))?;
+        let workspace_name = self.wc.workspace_name().to_owned();
+        let mut amend = sub_repo.view().get_wc_commit_id(&workspace_name) == Some(gitlink);
+        if amend {
+            // A superproject parent refers to the commit: it is history now.
+            let old_value = Some(TreeValue::GitSubmodule(gitlink.clone()));
+            for parent in wc_commit.parents().block_on()? {
+                amend &= !parent
+                    .tree()
+                    .path_value(path)
+                    .block_on()?
+                    .iter()
+                    .contains(&old_value);
+            }
+        }
+        let mut tx = sub_repo.start_transaction();
+        let builder = if amend {
+            tx.repo_mut().rewrite_commit(&base)
+        } else {
+            tx.repo_mut()
+                .new_commit(vec![gitlink.clone()], tree.clone())
+        };
+        let commit = builder.set_tree(tree).write().block_on()?;
+        tx.repo_mut()
+            .set_wc_commit(workspace_name, commit.id().clone())
+            .map_err(|err| error(path, err))?;
+        tx.repo_mut().rebase_descendants().block_on()?;
+        tx.commit("snapshot submodule working copy")
+            .block_on()
+            .map_err(|err| error(path, err))?;
+        self.snapshotted_submodule_states.push(state);
+        Ok(Some(commit.id().clone()))
+    }
+}
+
 #[async_trait]
 impl LockedWorkingCopy for LockedLocalWorkingCopy {
     fn old_operation_id(&self) -> &OperationId {
@@ -3492,6 +3606,54 @@ impl LockedWorkingCopy for LockedLocalWorkingCopy {
     }
 
     #[cfg(feature = "git")]
+    async fn snapshot_submodules(
+        &mut self,
+        wc_commit: &Commit,
+    ) -> Result<Option<MergedTree>, SnapshotError> {
+        let populated = self.populated_submodule_paths();
+        if populated.is_empty() {
+            return Ok(None);
+        }
+        // The cheap check first: usually nothing changed and nothing is read.
+        let mut maybe_dirty = vec![];
+        for path in populated {
+            let disk_dir = path.to_fs_path(&self.wc.working_copy_path)?;
+            if nested_maybe_dirty(&self.submodule_state_path(&path), &disk_dir) {
+                maybe_dirty.push(path);
+            }
+        }
+        if maybe_dirty.is_empty() {
+            return Ok(None);
+        }
+        let tree = self.wc.tree_state()?.current_tree().clone();
+        let names = gitmodules_by_path(&self.wc.store, &tree).await;
+        let mut tree_builder = MergedTreeBuilder::new(tree.clone());
+        let mut moved = false;
+        for path in maybe_dirty {
+            let Some(name) = names.get(&path) else {
+                continue;
+            };
+            let Some(TreeValue::GitSubmodule(gitlink)) =
+                tree.path_value(&path).await?.as_normal().cloned()
+            else {
+                continue;
+            };
+            if let Some(commit_id) = self.snapshot_submodule_at(&path, name, &gitlink, wc_commit)? {
+                tree_builder.set_or_remove(path, Some(TreeValue::GitSubmodule(commit_id)));
+                moved = true;
+            }
+        }
+        if !moved {
+            return Ok(None);
+        }
+        let new_tree = tree_builder.write_tree().await?;
+        // Only gitlink ids changed; the file states don't record those.
+        self.wc.tree_state_mut()?.tree = new_tree.clone();
+        self.tree_state_dirty = true;
+        Ok(Some(new_tree))
+    }
+
+    #[cfg(feature = "git")]
     async fn clear_submodule(&mut self, path: &RepoPath) -> Result<CheckoutStats, CheckoutError> {
         let mut stats = CheckoutStats::default();
         if self.submodule_state_path(path).exists() {
@@ -3602,6 +3764,12 @@ impl LockedWorkingCopy for LockedLocalWorkingCopy {
                     message: "Failed to write working copy state".to_string(),
                     err: Box::new(err),
                 })?;
+        }
+        for state in &mut self.snapshotted_submodule_states {
+            state.save().map_err(|err| WorkingCopyStateError {
+                message: "Failed to write submodule working copy state".to_string(),
+                err: Box::new(err),
+            })?;
         }
         if self.old_operation_id != operation_id || self.new_workspace_name.is_some() {
             self.wc.checkout_state.operation_id = operation_id;
