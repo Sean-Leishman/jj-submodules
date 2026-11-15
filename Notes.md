@@ -336,3 +336,23 @@ loading anything), load stores lazily, and run nested snapshots in parallel.
 - Drafted a comment for jj-vcs/jj#494 asking whether direct store access
   from the nested working copy is acceptable (scratchpad `upstream-post.md`,
   not posted; needs a public fork to link).
+
+### 2026-11-15 — Folded the post-rebase drift fixes into the commits they fix
+
+- `jj absorb` (system jj 0.43, in a `git clone --shared` scratch copy with
+  `immutable_heads()` pinned to the upstream base) placed all hunks of the two
+  drift-fix commits into 7 earlier commits; only the Cargo.lock line and one
+  import removal needed hands. The import hunk conflicted because the removed
+  line sat next to a line a later commit added; resolving it in the first
+  commit left rebase-artifact conflicts in every descendant, cleared by
+  restoring each commit's file from its own `at_operation(<absorb op>, X)`
+  version bottom-up. Each commit then differed from its post-absorb tree only
+  by the Cargo.lock line; head tree identical to the old head (ee7a17a38).
+- Series is 19 commits on upstream 4eb41bedc; first commit type-checks alone
+  (`cargo check -p jj-cli`). Other intermediate commits not checked yet.
+- Old head kept as `main-pre-absorb`; `main-pre-rebase` and
+  `refs/original/refs/heads/main` still exist too. Upstream main has moved
+  again (4eb41bedc → 632115a5e); rebase again just before splitting into PRs.
+- Lesson for scripted jj: `jj squash` opens `$EDITOR` to merge descriptions;
+  set `JJ_EDITOR=true` or pass `--use-destination-message`. zsh does not
+  word-split `$CMD`; use a shell function.
