@@ -356,3 +356,25 @@ loading anything), load stores lazily, and run nested snapshots in parallel.
 - Lesson for scripted jj: `jj squash` opens `$EDITOR` to merge descriptions;
   set `JJ_EDITOR=true` or pass `--use-destination-message`. zsh does not
   word-split `$CMD`; use a shell function.
+
+### 2026-11-15 — falsifier for Phase 2 (snapshot dirty submodules): passed
+
+- `test_git_submodule_snapshot_by_hand` does the snapshot steps by hand: load
+  the nested `TreeState` against the submodule repo's store, snapshot and
+  save it, write a commit in a submodule-repo transaction (child of the
+  gitlink target; the second time rewriting the first), then `jj git
+  submodule set` to move the gitlink in `@`.
+- All three kill checks pass with no change to the op log, the backend trait
+  or any non-test code: (1) `jj new @-` / `jj edit` reproduces the files byte
+  for byte (incl. a non-UTF-8 CRLF file) and the superproject diff is only
+  `M sub`; (2) `git cat-file -p` reads the commit from the submodule's git
+  dir, parent = old gitlink; (3) `jj undo` after the amending snapshot checks
+  out the first snapshot commit, which the submodule repo no longer shows as
+  visible, with no clobber warning; `jj redo` brings the second back.
+- So Phase 2 is ours to build: wire these steps into the superproject
+  snapshot path (behind `nested_maybe_dirty`), then `jj git submodule push`.
+- Found while reading, not tested: undo works on a hidden submodule commit
+  only because nothing gcs submodule repos. Superproject commits/ops are the
+  only thing referencing amended-away snapshots, so a future submodule gc
+  must treat superproject gitlinks as roots.
+- Not run: clippy (not installed for 1.97.1).

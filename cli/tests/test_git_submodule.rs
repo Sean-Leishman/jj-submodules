@@ -1779,3 +1779,195 @@ fn test_git_submodule_random_sequences() {
         log.clear();
     }
 }
+
+/// Falsifier for snapshotting submodules (Phase 2): does by hand, through the
+/// library, what a superproject snapshot would do for a dirty submodule, and
+/// checks that checkout, Git and undo cope without any change to the op log
+/// or the backend.
+#[test]
+fn test_git_submodule_snapshot_by_hand() {
+    use jj_lib::backend::CommitId;
+    use jj_lib::default_backend_factories::default_backend_factories;
+    use jj_lib::local_working_copy::TreeState;
+    use jj_lib::local_working_copy::TreeStateSettings;
+    use jj_lib::object_id::ObjectId as _;
+    use jj_lib::repo::Repo as _;
+    use jj_lib::repo::RepoLoader;
+    use pollster::FutureExt as _;
+
+    let test_env = TestEnvironment::default();
+    let work_dir = set_up_superproject(&test_env);
+    let submodule_dir = test_env.work_dir("submodule");
+    let sub_dir = work_dir.root().join("sub");
+    let read = |name: &str| std::fs::read(sub_dir.join(name)).ok();
+    work_dir
+        .run_jj(["git", "submodule", "clone", "sub"])
+        .success();
+    assert_eq!(read("sub").unwrap(), b"sub\n");
+    let gitlink = submodule_dir
+        .run_jj(["log", "--no-graph", "-r", "main", "-T", "commit_id"])
+        .success()
+        .stdout
+        .into_raw();
+
+    // Snapshots the submodule directory into the submodule repo and commits
+    // the tree there: on top of `base`, or rewriting `base` if `amend`.
+    let settings = testutils::user_settings();
+    let snapshot_submodule = |base: &str, amend: bool| -> String {
+        let sub_repo = RepoLoader::init_from_file_system(
+            &settings,
+            &work_dir.root().join(".jj/repo/submodule_store/sub"),
+            &default_backend_factories(),
+        )
+        .unwrap()
+        .load_at_head()
+        .block_on()
+        .unwrap();
+        let mut state = TreeState::load(
+            sub_repo.store().clone(),
+            sub_dir.clone(),
+            work_dir.root().join(".jj/working_copy/submodules/sub"),
+            &TreeStateSettings::try_from_user_settings(&settings).unwrap(),
+        )
+        .unwrap();
+        state
+            .snapshot(&testutils::empty_snapshot_options())
+            .block_on()
+            .unwrap();
+        state.save().unwrap();
+        let tree = state.current_tree().clone();
+        let base = sub_repo
+            .store()
+            .get_commit(&CommitId::try_from_hex(base).unwrap())
+            .unwrap();
+        let mut tx = sub_repo.start_transaction();
+        let builder = if amend {
+            tx.repo_mut().rewrite_commit(&base)
+        } else {
+            tx.repo_mut()
+                .new_commit(vec![base.id().clone()], tree.clone())
+        };
+        let commit = builder.set_tree(tree).write().block_on().unwrap();
+        tx.repo_mut().rebase_descendants().block_on().unwrap();
+        tx.commit("snapshot submodule working copy")
+            .block_on()
+            .unwrap();
+        commit.id().hex()
+    };
+
+    // Not text, so any eol or encoding mangling on the way back would show.
+    let added = b"\x00bin\r\n\xff";
+    std::fs::write(sub_dir.join("sub"), "edited\n").unwrap();
+    std::fs::write(sub_dir.join("added"), added).unwrap();
+    let first = snapshot_submodule(&gitlink, false);
+    let output = work_dir.run_jj(["git", "submodule", "set", "sub", &first]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Working copy  (@) now at: 
+    Parent commit (@-)      : Add submodule
+    Added 0 files, modified 1 files, removed 0 files
+    [EOF]
+    ");
+    let output = work_dir.run_jj(["status"]);
+    insta::assert_snapshot!(output, @"
+    Working copy changes:
+    M sub
+    Working copy  (@) : 
+    Parent commit (@-): Add submodule
+    [EOF]
+    ");
+    let change_id = work_dir
+        .run_jj(["log", "--no-graph", "-r", "@", "-T", "change_id"])
+        .success()
+        .stdout
+        .into_raw();
+
+    // 1. Round trip: away and back reproduces the submodule files, and the
+    // superproject commit holds nothing but the moved gitlink.
+    let output = work_dir.run_jj(["new", "@-"]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Working copy  (@) now at: 
+    Parent commit (@-)      : Add submodule
+    Added 0 files, modified 2 files, removed 1 files
+    [EOF]
+    ");
+    assert_eq!(read("sub").unwrap(), b"sub\n");
+    assert_eq!(read("added"), None);
+    let output = work_dir.run_jj(["edit", &change_id]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Working copy  (@) now at: 
+    Parent commit (@-)      : Add submodule
+    Added 1 files, modified 2 files, removed 0 files
+    [EOF]
+    ");
+    assert_eq!(read("sub").unwrap(), b"edited\n");
+    assert_eq!(read("added").unwrap(), added);
+    let output = work_dir.run_jj(["diff", "--summary", "-r", &change_id]);
+    insta::assert_snapshot!(output, @"
+    M sub
+    [EOF]
+    ");
+
+    // 2. Git can read the commit (it has to be pushable eventually).
+    let output = work_dir
+        .run_jj([
+            "util",
+            "exec",
+            "--",
+            "git",
+            "--git-dir",
+            ".jj/repo/submodule_store/sub/store/git",
+            "cat-file",
+            "-p",
+            &first,
+        ])
+        .success();
+    assert!(
+        output.stdout.raw().contains(&format!("parent {gitlink}")),
+        "{output}"
+    );
+
+    // 3. Undo: the gitlink moves back and the files follow, without a clobber
+    // warning; nothing is lost, since the commit stays in the submodule repo.
+    // Done after a second snapshot, which amends the first like jj amends @,
+    // so undo has to check out a commit the submodule repo no longer shows.
+    std::fs::write(sub_dir.join("sub"), "edited twice\n").unwrap();
+    std::fs::remove_file(sub_dir.join("added")).unwrap();
+    let second = snapshot_submodule(&first, true);
+    work_dir
+        .run_jj(["git", "submodule", "set", "sub", &second])
+        .success();
+    let output = work_dir.run_jj(["undo"]).normalize_stderr_with(hide_ids);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Undid operation: [id] (2001-02-03 08:05:22) set submodule sub to [id] in commit [id]
+    Restored to operation: [id] (2001-02-03 08:05:19) edit commit [id]
+    Working copy  (@) now at: 
+    Parent commit (@-)      : Add submodule
+    Added 1 files, modified 2 files, removed 0 files
+    [EOF]
+    ");
+    assert_eq!(read("sub").unwrap(), b"edited\n");
+    assert_eq!(read("added").unwrap(), added);
+    let output = work_dir.run_jj(["redo"]).normalize_stderr_with(hide_ids);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Restored to operation: [id] (2001-02-03 08:05:22) set submodule sub to [id] in commit [id]
+    Working copy  (@) now at: 
+    Parent commit (@-)      : Add submodule
+    Added 0 files, modified 2 files, removed 1 files
+    [EOF]
+    ");
+    assert_eq!(read("sub").unwrap(), b"edited twice\n");
+    assert_eq!(read("added"), None);
+    let output = work_dir.run_jj(["status"]);
+    insta::assert_snapshot!(output, @"
+    Working copy changes:
+    M sub
+    Working copy  (@) : 
+    Parent commit (@-): Add submodule
+    [EOF]
+    ");
+}
