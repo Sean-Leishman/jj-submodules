@@ -572,3 +572,65 @@ loading anything), load stores lazily, and run nested snapshots in parallel.
   pointer condition) so `jj edit <earlier>` + edit amends; (4) `describe -r`
   is then unnecessary (`jj edit` first). Open: submodule commits referenced
   by immutable superproject commits.
+
+### 2026-11-18 — follow-rewrites plan: sub-agent review and revised split
+
+Plan (five steps) was reviewed by a read-only sub-agent told to break it.
+Verdict: mechanism sound (`transform_descendants` visits roots parents-first,
+`reparent().set_tree().write()` is valid, bookmarks and every workspace's `@`
+follow), plan flawed in three places. What changed:
+
+- BUG in today's `submodule rebase`, confirmed by experiment: undo a
+  two-commit rebase, rebase again → "Rebased 1 commits … Nothing changed."
+  `move_commits(Roots)` finds descendants through visible heads, and after
+  the undo the superproject points at commits the submodule repo has hidden.
+  Fix: `MoveCommitsTarget::Commits` with the explicit `onto..old` set.
+  Principle: drive submodule rewrites from the superproject's gitlinks, never
+  from what the submodule repo happens to show as visible.
+- HOLE in today's guards, confirmed by reading: "tracked remote bookmark" is
+  not "created here". `push -b main` (allowed as a fast-forward) marks `main`
+  tracked, so other people's later commits on it pass the rebase guard; tags
+  aren't remote bookmarks; commits of a deleted upstream branch are on no
+  bookmark. The relaxed amend rule I planned would have folded local edits
+  into upstream commits ("bump the submodule, then fix a file"). Replace with
+  a positive test: a submodule commit is ours iff a transaction in this
+  submodule repo wrote it (the op log records `commit_predecessors` for
+  those; fetch/import doesn't). Needs a falsifier: is that lookup cheap and
+  exact (evolog machinery)?
+- ORDERING: the submodule transaction is committed before the superproject
+  one opens, so a failed superproject snapshot leaves rewritten-and-hidden
+  submodule commits behind. Fix: move submodule commit creation out of the
+  working copy into a lib-level step driven by the superproject snapshot;
+  write the commits, commit the superproject operation, then publish the
+  submodule operation. That layer also has the superproject data the later
+  steps need.
+- Snapshot scope: only descendants of `@` follow a snapshot (copy-on-write
+  for unrelated commits, no scan of all mutable commits, no ancestor of `@`
+  rewritten so colocated Git HEAD is never stale). `rebase`/`describe` scan
+  all mutable commits. One substitution path: rewrite `@` with its old
+  gitlink, plain `rebase_descendants()`, then substitute over `@::`.
+- Case I had missed: `jj edit` on an earlier commit that shares its parent's
+  gitlink creates a *child* submodule commit; later superproject commits with
+  their own submodule commits then need those rebased onto it in the
+  submodule (driven from their gitlinks), not just substituted.
+- Known and accepted: another workspace whose `@` gets substituted while its
+  submodule is dirty ends "gitlink moved, directory couldn't follow"; a
+  submodule that sits at a different path in older commits is missed.
+
+Revised split (one commit each, tests in each, docs as they land):
+ A. `rebase`/`describe`: all mutable superproject commits follow (shared
+    helper), explicit commit set for hidden chains, drop the
+    "earlier conflicts" refusal. Tests: the by-hand test made real;
+    undo-then-rebase-again; conflict in the earlier commit.
+ B. Ownership rule ("written here", from the submodule op log) for the
+    rebase and describe guards. Falsifier first.
+ C. Refactor, no behaviour change: submodule commit creation moves from the
+    working copy to `lib/src/git_submodule.rs`; submodule operation published
+    after the superproject's.
+ D. Protect submodule commits that immutable superproject commits refer to
+    (ancestors of the gitlinks at `immutable_heads()`), now that C has the
+    superproject data. Before E, because E rewrites more.
+ E. Snapshots: relaxed rule (ours, and not a parent's gitlink) plus
+    descendants of `@` following, together; neither is testable or safe
+    alone. Tests: edit-earlier amend; edit-earlier child case;
+    undo-then-edit; conflict in earlier commit → `jj edit` → resolve → push.
