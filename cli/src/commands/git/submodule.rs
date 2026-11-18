@@ -62,6 +62,7 @@ use crate::cli_util::short_commit_hash;
 use crate::command_error::CommandError;
 use crate::command_error::internal_error_with_message;
 use crate::command_error::user_error;
+use crate::description_util::join_message_paragraphs;
 use crate::git_util::GitSubprocessUi;
 use crate::git_util::print_git_import_stats_summary;
 use crate::git_util::print_push_stats;
@@ -81,6 +82,7 @@ use crate::ui::Ui;
 pub enum GitSubmoduleCommand {
     Clone(SubmoduleCloneArgs),
     Delete(SubmoduleDeleteArgs),
+    Describe(SubmoduleDescribeArgs),
     Fetch(SubmoduleFetchArgs),
     List(SubmoduleListArgs),
     Log(SubmoduleLogArgs),
@@ -114,6 +116,22 @@ pub struct SubmoduleDeleteArgs {
     /// Delete even submodules with commits that are on no remote
     #[arg(long)]
     force: bool,
+}
+
+/// Set the description of a submodule's local commit
+///
+/// Describes the submodule commit the working-copy commit's gitlink points
+/// at, typically a snapshot of changes made in the submodule's directory, and
+/// points the gitlink at the result. Later snapshots keep the description.
+/// Commits that are on a remote, or that a parent of the working-copy commit
+/// refers to, are not rewritten.
+#[derive(clap::Args, Clone, Debug)]
+pub struct SubmoduleDescribeArgs {
+    /// Name of the submodule
+    name: String,
+    /// The description (can be repeated for multiple paragraphs)
+    #[arg(long = "message", short, value_name = "MESSAGE", required = true)]
+    message_paragraphs: Vec<String>,
 }
 
 /// Fetch all branches and tags of cloned submodules from their remotes
@@ -231,6 +249,7 @@ pub async fn cmd_git_submodule(
     match subcommand {
         GitSubmoduleCommand::Clone(args) => cmd_submodule_clone(ui, command, args).await,
         GitSubmoduleCommand::Delete(args) => cmd_submodule_delete(ui, command, args).await,
+        GitSubmoduleCommand::Describe(args) => cmd_submodule_describe(ui, command, args).await,
         GitSubmoduleCommand::Fetch(args) => cmd_submodule_fetch(ui, command, args).await,
         GitSubmoduleCommand::List(args) => cmd_submodule_list(ui, command, args).await,
         GitSubmoduleCommand::Log(args) => cmd_submodule_log(ui, command, args).await,
@@ -803,6 +822,69 @@ async fn cmd_submodule_rebase(
     Ok(())
 }
 
+async fn cmd_submodule_describe(
+    ui: &mut Ui,
+    command: &CommandHelper,
+    args: &SubmoduleDescribeArgs,
+) -> Result<(), CommandError> {
+    let name = &args.name;
+    let mut workspace_command = command.workspace_helper(ui).await?;
+    let (commit, config, old_id, sub_repo) =
+        working_copy_gitlink(ui, command, &workspace_command, name).await?;
+    workspace_command.check_rewritable([commit.id()]).await?;
+    // Same rule as for snapshots: what others or the superproject's history
+    // refer to stays as it is.
+    let on_remote = RevisionArg::from(format!("{} & ::untracked_remote_bookmarks()", old_id.hex()));
+    let reason = if !submodule_revset(ui, command, &workspace_command, &sub_repo, &on_remote)
+        .await?
+        .is_empty()
+    {
+        Some("is on a remote")
+    } else {
+        let old_value = Some(TreeValue::GitSubmodule(old_id.clone()));
+        let mut in_parent = false;
+        for parent in commit.parents().await? {
+            in_parent |= parent
+                .tree()
+                .path_value(&config.path)
+                .await?
+                .iter()
+                .contains(&old_value);
+        }
+        in_parent.then_some("is referred to by a parent of the working-copy commit")
+    };
+    if let Some(reason) = reason {
+        return Err(user_error(format!(
+            "Won't describe commit {} of submodule {name:?} since it {reason}",
+            short_commit_hash(&old_id)
+        )));
+    }
+    let old_commit = sub_repo.store().get_commit(&old_id)?;
+    let description = join_message_paragraphs(&args.message_paragraphs);
+    if description == old_commit.description() {
+        writeln!(ui.status(), "Nothing changed.")?;
+        return Ok(());
+    }
+    let mut tx = sub_repo.start_transaction();
+    let new_commit = tx
+        .repo_mut()
+        .rewrite_commit(&old_commit)
+        .set_description(description)
+        .write()
+        .await?;
+    tx.repo_mut().rebase_descendants().await?;
+    tx.commit(format!("describe commit {}", old_id.hex()))
+        .await?;
+    set_gitlink(
+        ui,
+        &mut workspace_command,
+        &commit,
+        &config,
+        new_commit.id(),
+    )
+    .await
+}
+
 async fn cmd_submodule_push(
     ui: &mut Ui,
     command: &CommandHelper,
@@ -870,7 +952,10 @@ async fn cmd_submodule_push(
             short_commit_hash(&id)
         ));
         if !commit.has_conflict() {
-            error.add_hint("Use `--allow-empty-description` to push it anyway.");
+            error.add_hint(format!(
+                "Describe it with `jj git submodule describe {name} -m <message>`, or use \
+                 `--allow-empty-description` to push it anyway."
+            ));
         }
         return Err(error);
     }

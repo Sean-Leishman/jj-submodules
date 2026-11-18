@@ -2185,8 +2185,8 @@ fn test_git_submodule_rebase() {
     "#);
 }
 
-/// `jj git submodule push` publishes snapshot commits to a bookmark on the
-/// submodule's remote and keeps track of that bookmark.
+/// `jj git submodule describe` and `push` publish snapshot commits to a
+/// bookmark on the submodule's remote and keep track of that bookmark.
 #[test]
 fn test_git_submodule_push() {
     let test_env = TestEnvironment::default();
@@ -2206,9 +2206,21 @@ fn test_git_submodule_push() {
             .stdout
             .into_raw()
     };
+    let describe = || {
+        work_dir
+            .run_jj(["git", "submodule", "describe", "sub", "-m", "Edit sub"])
+            .normalize_stderr_with(hide_ids)
+    };
     work_dir
         .run_jj(["git", "submodule", "clone", "sub"])
         .success();
+    // Upstream's commits aren't ours to describe.
+    insta::assert_snapshot!(describe(), @r#"
+    ------- stderr -------
+    Error: Won't describe commit [id] of submodule "sub" since it is on a remote
+    [EOF]
+    [exit status: 1]
+    "#);
     std::fs::write(sub_dir.join("sub"), "edited\n").unwrap();
     work_dir
         .run_jj(["bookmark", "create", "-r", "@", "bumped"])
@@ -2225,28 +2237,54 @@ fn test_git_submodule_push() {
     insta::assert_snapshot!(push(&["-b", "topic"]), @r#"
     ------- stderr -------
     Error: Won't push commit [id] of submodule "sub" since it has no description
-    Hint: Use `--allow-empty-description` to push it anyway.
+    Hint: Describe it with `jj git submodule describe sub -m <message>`, or use `--allow-empty-description` to push it anyway.
     [EOF]
     [exit status: 1]
     "#);
-    insta::assert_snapshot!(push(&["-b", "topic", "--allow-empty-description"]), @r#"
+    insta::assert_snapshot!(push(&["-b", "scratch", "--allow-empty-description"]), @r#"
+    ------- stderr -------
+    Pushed commit [id] of submodule "sub" to scratch@origin
+    [EOF]
+    "#);
+    assert_eq!(remote_bookmark("scratch"), gitlink(&work_dir));
+    // Described, it is pushed without the override.
+    insta::assert_snapshot!(describe(), @"
+    ------- stderr -------
+    Working copy  (@) now at: 
+    Parent commit (@-)      : Add submodule
+    Added 0 files, modified 1 files, removed 0 files
+    [EOF]
+    ");
+    insta::assert_snapshot!(describe(), @"
+    ------- stderr -------
+    Nothing changed.
+    [EOF]
+    ");
+    insta::assert_snapshot!(push(&["-b", "topic"]), @r#"
     ------- stderr -------
     Pushed commit [id] of submodule "sub" to topic@origin
     [EOF]
     "#);
     assert_eq!(remote_bookmark("topic"), gitlink(&work_dir));
+    // Without a name, every bookmark that followed the commit is pushed.
+    insta::assert_snapshot!(push(&[]), @r#"
+    ------- stderr -------
+    Pushed commit [id] of submodule "sub" to scratch@origin, topic@origin
+    [EOF]
+    "#);
+    assert_eq!(remote_bookmark("scratch"), gitlink(&work_dir));
     insta::assert_snapshot!(push(&[]), @"
     ------- stderr -------
     Nothing changed.
     [EOF]
     ");
 
-    // Later changes rewrite the commit; the bookmark follows it and is pushed
-    // again without being named.
+    // Later changes rewrite the commit, keeping its description; the
+    // bookmarks follow it and are pushed again without being named.
     std::fs::write(sub_dir.join("sub"), "edited twice\n").unwrap();
-    insta::assert_snapshot!(push(&["--allow-empty-description"]), @r#"
+    insta::assert_snapshot!(push(&[]), @r#"
     ------- stderr -------
-    Pushed commit [id] of submodule "sub" to topic@origin
+    Pushed commit [id] of submodule "sub" to scratch@origin, topic@origin
     [EOF]
     "#);
     assert_eq!(remote_bookmark("topic"), gitlink(&work_dir));
@@ -2259,7 +2297,7 @@ fn test_git_submodule_push() {
         .run_jj(["bookmark", "move", "main", "--to", "@-"])
         .success();
     work_dir.run_jj(["git", "submodule", "fetch"]).success();
-    insta::assert_snapshot!(push(&["-b", "main", "--allow-empty-description"]), @r#"
+    insta::assert_snapshot!(push(&["-b", "main"]), @r#"
     ------- stderr -------
     Error: Bookmark main@origin of submodule "sub" is not an ancestor of the commit to push
     Hint: `jj git submodule rebase sub -d main@origin` moves the local commits on top of it.
@@ -2271,16 +2309,16 @@ fn test_git_submodule_push() {
     work_dir
         .run_jj(["git", "submodule", "rebase", "sub", "-d", "main@origin"])
         .success();
-    insta::assert_snapshot!(push(&["--allow-empty-description"]), @r#"
+    insta::assert_snapshot!(push(&[]), @r#"
     ------- stderr -------
     Error: Won't push commit [id] of submodule "sub" since it has conflicts
     [EOF]
     [exit status: 1]
     "#);
     std::fs::write(sub_dir.join("sub"), "resolved\n").unwrap();
-    insta::assert_snapshot!(push(&["--allow-empty-description"]), @r#"
+    insta::assert_snapshot!(push(&[]), @r#"
     ------- stderr -------
-    Pushed commit [id] of submodule "sub" to topic@origin
+    Pushed commit [id] of submodule "sub" to scratch@origin, topic@origin
     [EOF]
     "#);
     assert_eq!(remote_bookmark("topic"), gitlink(&work_dir));
@@ -2297,6 +2335,16 @@ fn test_git_submodule_push() {
         std::fs::read_to_string(clone_dir.root().join("sub/sub")).unwrap(),
         "resolved\n"
     );
+
+    // Once a superproject commit refers to the submodule commit, it is
+    // history.
+    work_dir.run_jj(["commit", "-m", "bump sub"]).success();
+    insta::assert_snapshot!(describe(), @r#"
+    ------- stderr -------
+    Error: Won't describe commit [id] of submodule "sub" since it is referred to by a parent of the working-copy commit
+    [EOF]
+    [exit status: 1]
+    "#);
 
     // Everything is on the remote now: the repo no longer holds the only
     // copy and can be deleted.

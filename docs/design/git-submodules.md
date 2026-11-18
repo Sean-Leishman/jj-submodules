@@ -181,7 +181,8 @@ implemented in Phase 1:
   `.gitmodules` URLs resolve against the superproject's `origin`, and URL
   changes in the working-copy commit's `.gitmodules` are followed on fetch.
 - Manual management:
-  `jj git submodule clone|fetch|list|log|delete|populate|set|rebase|push`
+  `jj git submodule
+  clone|fetch|list|log|delete|populate|set|rebase|describe|push`
   (hidden while experimental). `set` points a gitlink at a commit already in
   the submodule store, given as a revset parsed in the superproject and
   resolved in the submodule repo; it also resolves a conflicted gitlink.
@@ -218,8 +219,7 @@ Implemented (experimental, `git.snapshot-submodules`):
   commits that are on none of its remotes.
 - Not done yet: the user's global ignores, auto-track patterns and
   `snapshot.max-new-file-size` don't apply inside submodules; nothing
-  garbage-collects snapshot commits the superproject no longer refers to;
-  snapshot commits have no description and no command sets one.
+  garbage-collects snapshot commits the superproject no longer refers to.
 
 ### Merging/rebasing with submodules
 
@@ -254,7 +254,12 @@ tracked local bookmark, which is what "pushed from here" means afterwards:
   `main`) is only ever moved forward.
 
 Commits with conflicts are refused, and so are commits without a description
-unless `--allow-empty-description` is given.
+unless `--allow-empty-description` is given. Snapshot commits start without
+one; `jj git submodule describe <name> -m <message>` sets it on the commit the
+working-copy commit's gitlink points at (later snapshots keep it), under the
+same rule as snapshots: not if the commit is on an untracked remote bookmark
+or a parent of the working-copy commit refers to it. So a submodule commit is
+described before the superproject change that contains it is committed.
 
 TODO: make the superproject commits that refer to rewritten submodule commits
 follow them, and merge diverging gitlinks by merging/rebasing in the

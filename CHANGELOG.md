@@ -189,8 +189,8 @@ and this project adheres to
   the submodule store, `jj git submodule log` shows a submodule's history, and
   `jj git submodule set` points a gitlink at another submodule commit (also
   resolving a conflicted gitlink), `jj git submodule rebase` moves local
-  submodule commits onto another one, and `jj git submodule push` pushes them
-  to a bookmark on the submodule's remote. Submodules that
+  submodule commits onto another one, and `jj git submodule describe` and `push`
+  describe them and push them to a bookmark on the submodule's remote. Submodules that
   aren't cloned (or whose commit isn't fetched) are left as empty directories
   with a warning, and `jj status` lists them. Changes inside a submodule
   directory are snapshotted into a commit of the submodule, which the

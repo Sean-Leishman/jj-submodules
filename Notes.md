@@ -518,3 +518,27 @@ loading anything), load stores lazily, and run nested snapshots in parallel.
   unresolvable (only `@`'s gitlink follows rewrites).
 - `working_copy_gitlink()` now shared by rebase and push.
 - Verified on 1.97.1: 1162 CLI tests. Upstream main is 322 commits ahead.
+
+### 2026-11-18 — Phase 2, step 4: `jj git submodule describe`
+
+- `jj git submodule describe <name> -m <message>` (repeatable `-m`, no
+  editor): rewrites `@`'s gitlink commit with the description in a submodule
+  transaction and moves the gitlink (`set_gitlink`). The description survives
+  later snapshots, rebases and conflict resolution, since all of them go
+  through `rewrite_commit`; the push test now needs the
+  `--allow-empty-description` override only where it tests it.
+- Same rewrite rule as snapshots, enforced here too: refused if the commit is
+  an ancestor of an untracked remote bookmark ("is on a remote") or a parent
+  of `@` has that gitlink. So the workflow is: edit, `submodule describe`,
+  then `jj commit` in the superproject. Describing after the superproject
+  commit is refused; that is the same wall as unresolvable conflicts in
+  earlier submodule commits.
+- `submodule push -b <name>` pushes only the named bookmark; without `-b`
+  every tracked bookmark at the gitlink is pushed (the test had assumed the
+  former pushed all).
+- With this the edit → describe → push → rebase → resolve → push loop is
+  complete for a single local commit per submodule. What remains is all one
+  problem: superproject commits don't follow rewritten submodule commits
+  (multi-commit conflicts, describing earlier commits, gitlink merges). Take
+  that to #494 before building.
+- Verified on 1.97.1: 1162 CLI tests.
