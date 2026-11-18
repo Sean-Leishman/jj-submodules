@@ -490,3 +490,31 @@ loading anything), load stores lazily, and run nested snapshots in parallel.
   bench binary kept in `target/opt` (build: `CARGO_PROFILE_DEV_OPT_LEVEL=3
   CARGO_PROFILE_DEV_DEBUG=0 cargo build -p jj-cli --target-dir target/opt
   -j4`, 9 min cold).
+
+### 2026-11-18 — Phase 2, step 3: `jj git submodule push`
+
+- Falsifier first (by hand, then replaced by the real test): plain `git push`
+  of a snapshot commit from the submodule's store is accepted; fetching it
+  back gives the same id, now on a remote (delete guard lifts); a fresh clone
+  of the superproject populates the submodule at it. Passed, nothing to
+  change.
+- `jj git submodule push <name> [-b <bookmark>] [--allow-empty-description]`
+  pushes `@`'s gitlink commit to `origin` with `git::push_refs` (so the same
+  lease check as `jj git push`). No superproject operation.
+- Decision: the pushed bookmark becomes a *tracked local bookmark in the
+  submodule repo*. That one piece of state answers three questions: which
+  bookmark to push next time (local bookmarks at the gitlink; jj moves them
+  along rewrites), what may be rewritten (rebase guard is now
+  `::untracked_remote_bookmarks()`, mirroring jj's `immutable_heads()`), and
+  what must not be clobbered (a remote bookmark with no local one, e.g.
+  `main`, only moves forward; no override flag).
+- Refuses conflicted commits, and commits without a description unless
+  `--allow-empty-description`.
+- Gap this exposes: snapshot commits never have a description and nothing
+  sets one, so every real push needs the override. Next: `jj git submodule
+  describe <name> -m` for the tip (rewrite + move gitlink, same shape as
+  rebase; `rewrite_commit` keeps it through later snapshots). Earlier local
+  commits stay undescribable for the same reason their conflicts are
+  unresolvable (only `@`'s gitlink follows rewrites).
+- `working_copy_gitlink()` now shared by rebase and push.
+- Verified on 1.97.1: 1162 CLI tests. Upstream main is 322 commits ahead.

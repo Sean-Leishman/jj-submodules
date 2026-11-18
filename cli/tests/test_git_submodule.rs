@@ -2184,3 +2184,126 @@ fn test_git_submodule_rebase() {
     [exit status: 1]
     "#);
 }
+
+/// `jj git submodule push` publishes snapshot commits to a bookmark on the
+/// submodule's remote and keeps track of that bookmark.
+#[test]
+fn test_git_submodule_push() {
+    let test_env = TestEnvironment::default();
+    let work_dir = set_up_superproject(&test_env);
+    let submodule_dir = test_env.work_dir("submodule");
+    let sub_dir = work_dir.root().join("sub");
+    let push = |args: &[&str]| {
+        work_dir
+            .run_jj([&["git", "submodule", "push", "sub"], args].concat())
+            .normalize_stderr_with(hide_ids)
+    };
+    // What the bookmark points at on the remote, which is a jj repo itself.
+    let remote_bookmark = |name: &str| {
+        submodule_dir
+            .run_jj(["log", "--no-graph", "-r", name, "-T", "commit_id"])
+            .success()
+            .stdout
+            .into_raw()
+    };
+    work_dir
+        .run_jj(["git", "submodule", "clone", "sub"])
+        .success();
+    std::fs::write(sub_dir.join("sub"), "edited\n").unwrap();
+    work_dir
+        .run_jj(["bookmark", "create", "-r", "@", "bumped"])
+        .success();
+
+    // It needs a bookmark to push to, and commits worth pushing.
+    insta::assert_snapshot!(push(&[]), @r#"
+    ------- stderr -------
+    Error: No bookmark of submodule "sub" points at the commit to push
+    Hint: Use `--bookmark` to name the bookmark to push to.
+    [EOF]
+    [exit status: 1]
+    "#);
+    insta::assert_snapshot!(push(&["-b", "topic"]), @r#"
+    ------- stderr -------
+    Error: Won't push commit [id] of submodule "sub" since it has no description
+    Hint: Use `--allow-empty-description` to push it anyway.
+    [EOF]
+    [exit status: 1]
+    "#);
+    insta::assert_snapshot!(push(&["-b", "topic", "--allow-empty-description"]), @r#"
+    ------- stderr -------
+    Pushed commit [id] of submodule "sub" to topic@origin
+    [EOF]
+    "#);
+    assert_eq!(remote_bookmark("topic"), gitlink(&work_dir));
+    insta::assert_snapshot!(push(&[]), @"
+    ------- stderr -------
+    Nothing changed.
+    [EOF]
+    ");
+
+    // Later changes rewrite the commit; the bookmark follows it and is pushed
+    // again without being named.
+    std::fs::write(sub_dir.join("sub"), "edited twice\n").unwrap();
+    insta::assert_snapshot!(push(&["--allow-empty-description"]), @r#"
+    ------- stderr -------
+    Pushed commit [id] of submodule "sub" to topic@origin
+    [EOF]
+    "#);
+    assert_eq!(remote_bookmark("topic"), gitlink(&work_dir));
+
+    // A bookmark that wasn't pushed from here only moves forward.
+    submodule_dir.run_jj(["new", "main"]).success();
+    submodule_dir.write_file("sub", "upstream\n");
+    submodule_dir.run_jj(["commit", "-m", "upstream"]).success();
+    submodule_dir
+        .run_jj(["bookmark", "move", "main", "--to", "@-"])
+        .success();
+    work_dir.run_jj(["git", "submodule", "fetch"]).success();
+    insta::assert_snapshot!(push(&["-b", "main", "--allow-empty-description"]), @r#"
+    ------- stderr -------
+    Error: Bookmark main@origin of submodule "sub" is not an ancestor of the commit to push
+    Hint: `jj git submodule rebase sub -d main@origin` moves the local commits on top of it.
+    [EOF]
+    [exit status: 1]
+    "#);
+    // The pushed commit is ours, so it can still be rebased. Conflicts are
+    // not pushed.
+    work_dir
+        .run_jj(["git", "submodule", "rebase", "sub", "-d", "main@origin"])
+        .success();
+    insta::assert_snapshot!(push(&["--allow-empty-description"]), @r#"
+    ------- stderr -------
+    Error: Won't push commit [id] of submodule "sub" since it has conflicts
+    [EOF]
+    [exit status: 1]
+    "#);
+    std::fs::write(sub_dir.join("sub"), "resolved\n").unwrap();
+    insta::assert_snapshot!(push(&["--allow-empty-description"]), @r#"
+    ------- stderr -------
+    Pushed commit [id] of submodule "sub" to topic@origin
+    [EOF]
+    "#);
+    assert_eq!(remote_bookmark("topic"), gitlink(&work_dir));
+
+    // A fresh clone of the superproject gets the submodule's files at that
+    // commit.
+    let source = format!("{}/repo", test_env.env_root().display());
+    test_env
+        .run_jj_in(".", ["git", "clone", &source, "clone"])
+        .success();
+    let clone_dir = test_env.work_dir("clone");
+    clone_dir.run_jj(["new", "bumped@origin"]).success();
+    assert_eq!(
+        std::fs::read_to_string(clone_dir.root().join("sub/sub")).unwrap(),
+        "resolved\n"
+    );
+
+    // Everything is on the remote now: the repo no longer holds the only
+    // copy and can be deleted.
+    let output = work_dir.run_jj(["git", "submodule", "delete", "sub"]);
+    insta::assert_snapshot!(output, @r#"
+    ------- stderr -------
+    Deleted submodule "sub"
+    [EOF]
+    "#);
+}

@@ -25,6 +25,9 @@ use jj_lib::backend::CommitId;
 use jj_lib::backend::TreeValue;
 use jj_lib::commit::Commit;
 use jj_lib::git;
+use jj_lib::git::GitPushOptions;
+use jj_lib::git::GitPushRefTargets;
+use jj_lib::git::GitSettings;
 use jj_lib::git::get_git_backend;
 use jj_lib::git::get_git_repo;
 use jj_lib::git_submodule;
@@ -33,8 +36,11 @@ use jj_lib::git_submodule::SubmoduleConfig;
 use jj_lib::graph::GraphEdge;
 use jj_lib::graph::GraphEdgeType;
 use jj_lib::id_prefix::IdPrefixContext;
+use jj_lib::merge::Diff;
 use jj_lib::merged_tree_builder::MergedTreeBuilder;
 use jj_lib::object_id::ObjectId as _;
+use jj_lib::op_store::RefTarget;
+use jj_lib::ref_name::RefNameBuf;
 use jj_lib::repo::ReadonlyRepo;
 use jj_lib::repo::Repo as _;
 use jj_lib::repo_path::RepoPath;
@@ -52,11 +58,13 @@ use crate::cli_util::RevisionArg;
 use crate::cli_util::WorkspaceCommandHelper;
 use crate::cli_util::format_template;
 use crate::cli_util::print_checkout_stats;
+use crate::cli_util::short_commit_hash;
 use crate::command_error::CommandError;
 use crate::command_error::internal_error_with_message;
 use crate::command_error::user_error;
 use crate::git_util::GitSubprocessUi;
 use crate::git_util::print_git_import_stats_summary;
+use crate::git_util::print_push_stats;
 use crate::graphlog::GraphStyle;
 use crate::graphlog::get_graphlog;
 use crate::revset_util::RevsetExpressionEvaluator;
@@ -78,6 +86,7 @@ pub enum GitSubmoduleCommand {
     Log(SubmoduleLogArgs),
     Populate(SubmodulePopulateArgs),
     PrintGitmodules(SubmodulePrintGitmodulesArgs),
+    Push(SubmodulePushArgs),
     Rebase(SubmoduleRebaseArgs),
     Set(SubmoduleSetArgs),
 }
@@ -156,6 +165,25 @@ pub struct SubmodulePrintGitmodulesArgs {
     revision: RevisionArg,
 }
 
+/// Push a submodule's commits to its remote
+///
+/// Pushes the commit the working-copy commit's gitlink points at to a bookmark
+/// on the submodule's `origin` remote. The submodule repo remembers the
+/// bookmark: it follows the commit when later snapshots or `jj git submodule
+/// rebase` rewrite it, and is then pushed again without being named.
+#[derive(clap::Args, Clone, Debug)]
+pub struct SubmodulePushArgs {
+    /// Name of the submodule
+    name: String,
+    /// Bookmark on the submodule's remote to push to [default: the pushed
+    /// bookmarks that followed the commit]
+    #[arg(long, short)]
+    bookmark: Option<String>,
+    /// Allow pushing commits with empty descriptions
+    #[arg(long)]
+    allow_empty_description: bool,
+}
+
 /// Move a submodule's local commits onto another commit of the submodule
 ///
 /// Rebases the submodule commits that lead up to the working-copy commit's
@@ -207,6 +235,7 @@ pub async fn cmd_git_submodule(
         GitSubmoduleCommand::List(args) => cmd_submodule_list(ui, command, args).await,
         GitSubmoduleCommand::Log(args) => cmd_submodule_log(ui, command, args).await,
         GitSubmoduleCommand::Populate(args) => cmd_submodule_populate(ui, command, args).await,
+        GitSubmoduleCommand::Push(args) => cmd_submodule_push(ui, command, args).await,
         GitSubmoduleCommand::Rebase(args) => cmd_submodule_rebase(ui, command, args).await,
         GitSubmoduleCommand::Set(args) => cmd_submodule_set(ui, command, args).await,
         GitSubmoduleCommand::PrintGitmodules(args) => {
@@ -691,26 +720,9 @@ async fn cmd_submodule_rebase(
 ) -> Result<(), CommandError> {
     let name = &args.name;
     let mut workspace_command = command.workspace_helper(ui).await?;
-    let commit = workspace_command
-        .resolve_single_rev(ui, &RevisionArg::AT)
-        .await?;
+    let (commit, config, old_id, sub_repo) =
+        working_copy_gitlink(ui, command, &workspace_command, name).await?;
     workspace_command.check_rewritable([commit.id()]).await?;
-    let repo = workspace_command.repo().clone();
-    let submodules = git_submodule::read_gitmodules(repo.store(), &commit.tree()).await?;
-    let Some(config) = submodules.get(name) else {
-        return Err(user_error(format!(
-            "Submodule {name:?} is not declared in .gitmodules"
-        )));
-    };
-    let Some(old_id) = git_submodule::submodule_gitlinks(&commit.tree(), &submodules)
-        .await?
-        .remove(name)
-    else {
-        return Err(user_error(format!(
-            "Submodule {name:?} has no resolved gitlink in the working-copy commit"
-        )));
-    };
-    let sub_repo = load_submodule(&repo, name).await?;
     let onto_id =
         submodule_single_commit(ui, command, &workspace_command, &sub_repo, name, &args.onto)
             .await?;
@@ -719,21 +731,13 @@ async fn cmd_submodule_rebase(
         let revision = RevisionArg::from(revset);
         submodule_revset(ui, command, &workspace_command, &sub_repo, &revision).await
     };
-    // Commits fetched by hash are in the store but in no revset.
-    if evaluate(format!("present({old})")).await?.is_empty() {
-        return Err(user_error(format!(
-            "Commit {old} is not in the history of submodule {name:?}"
-        ))
-        .hinted(format!(
-            "`jj git submodule set {name}` can point the gitlink at another commit."
-        )));
-    }
     let roots = evaluate(format!("roots({onto}..{old})")).await?;
     let new_id = if roots.is_empty() {
         // Nothing local: the old commit is the destination or an ancestor.
         onto_id
     } else {
-        if !evaluate(format!("({onto}..{old}) & ::remote_bookmarks()"))
+        // Bookmarks pushed from here are tracked and may be rewritten.
+        if !evaluate(format!("({onto}..{old}) & ::untracked_remote_bookmarks()"))
             .await?
             .is_empty()
         {
@@ -789,7 +793,7 @@ async fn cmd_submodule_rebase(
         writeln!(ui.status(), "Nothing changed.")?;
         return Ok(());
     }
-    set_gitlink(ui, &mut workspace_command, &commit, config, &new_id).await?;
+    set_gitlink(ui, &mut workspace_command, &commit, &config, &new_id).await?;
     if sub_repo.store().get_commit(&new_id)?.has_conflict() {
         writeln!(
             ui.warning_default(),
@@ -797,6 +801,169 @@ async fn cmd_submodule_rebase(
         )?;
     }
     Ok(())
+}
+
+async fn cmd_submodule_push(
+    ui: &mut Ui,
+    command: &CommandHelper,
+    args: &SubmodulePushArgs,
+) -> Result<(), CommandError> {
+    let name = &args.name;
+    let workspace_command = command.workspace_helper(ui).await?;
+    let (_, _, commit_id, sub_repo) =
+        working_copy_gitlink(ui, command, &workspace_command, name).await?;
+    let id = commit_id.hex();
+    let evaluate = async |revset: String| {
+        let revision = RevisionArg::from(revset);
+        submodule_revset(ui, command, &workspace_command, &sub_repo, &revision).await
+    };
+    let remote = git_submodule::SUBMODULE_REMOTE;
+    let view = sub_repo.view();
+    let bookmarks: Vec<RefNameBuf> = match &args.bookmark {
+        Some(bookmark) => {
+            let bookmark = RefNameBuf::from(bookmark.as_str());
+            // Not pushed from here before, so not ours to move anywhere but
+            // forward.
+            if view.get_local_bookmark(&bookmark).is_absent()
+                && let Some(remote_id) = view
+                    .get_remote_bookmark(bookmark.to_remote_symbol(remote))
+                    .target
+                    .as_normal()
+                && evaluate(format!("{} & ::{id}", remote_id.hex()))
+                    .await?
+                    .is_empty()
+            {
+                let symbol = bookmark.to_remote_symbol(remote);
+                return Err(user_error(format!(
+                    "Bookmark {symbol} of submodule {name:?} is not an ancestor of the commit to \
+                     push"
+                ))
+                .hinted(format!(
+                    "`jj git submodule rebase {name} -d {symbol}` moves the local commits on top \
+                     of it."
+                )));
+            }
+            vec![bookmark]
+        }
+        None => view
+            .local_bookmarks_for_commit(&commit_id)
+            .map(|(bookmark, _)| bookmark.to_owned())
+            .collect(),
+    };
+    if bookmarks.is_empty() {
+        return Err(user_error(format!(
+            "No bookmark of submodule {name:?} points at the commit to push"
+        ))
+        .hinted("Use `--bookmark` to name the bookmark to push to."));
+    }
+    for id in evaluate(format!("remote_bookmarks()..{id}")).await? {
+        let commit = sub_repo.store().get_commit(&id)?;
+        let reason = if commit.has_conflict() {
+            "has conflicts"
+        } else if commit.description().is_empty() && !args.allow_empty_description {
+            "has no description"
+        } else {
+            continue;
+        };
+        let mut error = user_error(format!(
+            "Won't push commit {} of submodule {name:?} since it {reason}",
+            short_commit_hash(&id)
+        ));
+        if !commit.has_conflict() {
+            error.add_hint("Use `--allow-empty-description` to push it anyway.");
+        }
+        return Err(error);
+    }
+
+    let mut tx = sub_repo.start_transaction();
+    let mut targets = GitPushRefTargets::default();
+    for bookmark in &bookmarks {
+        let before = tx
+            .repo()
+            .view()
+            .get_remote_bookmark(bookmark.to_remote_symbol(remote))
+            .target
+            .as_normal()
+            .cloned();
+        tx.repo_mut()
+            .set_local_bookmark_target(bookmark, RefTarget::normal(commit_id.clone()));
+        if before.as_ref() != Some(&commit_id) {
+            let update = Diff::new(before, Some(commit_id.clone()));
+            targets.bookmarks.push((bookmark.clone(), update));
+        }
+    }
+    if targets.bookmarks.is_empty() {
+        writeln!(ui.status(), "Nothing changed.")?;
+        return Ok(());
+    }
+    let stats = git::push_refs(
+        tx.repo_mut(),
+        GitSettings::from_settings(workspace_command.settings())?.to_subprocess_options(),
+        remote,
+        &targets,
+        &mut GitSubprocessUi::new(ui),
+        &GitPushOptions::default(),
+    )?;
+    print_push_stats(ui, &stats)?;
+    if !stats.all_ok() {
+        return Err(user_error(format!("Failed to push submodule {name:?}")));
+    }
+    let pushed = bookmarks
+        .iter()
+        .map(|bookmark| bookmark.to_remote_symbol(remote).to_string())
+        .join(", ");
+    tx.commit(format!("push {pushed} to git remote")).await?;
+    writeln!(
+        ui.status(),
+        "Pushed commit {} of submodule {name:?} to {pushed}",
+        short_commit_hash(&commit_id)
+    )?;
+    Ok(())
+}
+
+/// The working-copy commit, and for its submodule `name`: the `.gitmodules`
+/// entry, the commit the gitlink points at, and the repo, which must have
+/// that commit in its history.
+async fn working_copy_gitlink(
+    ui: &Ui,
+    command: &CommandHelper,
+    workspace_command: &WorkspaceCommandHelper,
+    name: &str,
+) -> Result<(Commit, SubmoduleConfig, CommitId, Arc<ReadonlyRepo>), CommandError> {
+    let commit = workspace_command
+        .resolve_single_rev(ui, &RevisionArg::AT)
+        .await?;
+    let repo = workspace_command.repo();
+    let mut submodules = git_submodule::read_gitmodules(repo.store(), &commit.tree()).await?;
+    let gitlink = git_submodule::submodule_gitlinks(&commit.tree(), &submodules)
+        .await?
+        .remove(name);
+    let Some(config) = submodules.remove(name) else {
+        return Err(user_error(format!(
+            "Submodule {name:?} is not declared in .gitmodules"
+        )));
+    };
+    let Some(gitlink) = gitlink else {
+        return Err(user_error(format!(
+            "Submodule {name:?} has no resolved gitlink in the working-copy commit"
+        )));
+    };
+    let sub_repo = load_submodule(repo, name).await?;
+    // Commits fetched by hash are in the store but in no revset.
+    let present = RevisionArg::from(format!("present({})", gitlink.hex()));
+    if submodule_revset(ui, command, workspace_command, &sub_repo, &present)
+        .await?
+        .is_empty()
+    {
+        return Err(user_error(format!(
+            "Commit {} is not in the history of submodule {name:?}",
+            gitlink.hex()
+        ))
+        .hinted(format!(
+            "`jj git submodule set {name}` can point the gitlink at another commit."
+        )));
+    }
+    Ok((commit, config, gitlink, sub_repo))
 }
 
 /// Rewrites `commit` so the gitlink of submodule `config` points at

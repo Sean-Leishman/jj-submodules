@@ -181,7 +181,7 @@ implemented in Phase 1:
   `.gitmodules` URLs resolve against the superproject's `origin`, and URL
   changes in the working-copy commit's `.gitmodules` are followed on fetch.
 - Manual management:
-  `jj git submodule clone|fetch|list|log|delete|populate|set|rebase`
+  `jj git submodule clone|fetch|list|log|delete|populate|set|rebase|push`
   (hidden while experimental). `set` points a gitlink at a commit already in
   the submodule store, given as a revset parsed in the superproject and
   resolved in the submodule repo; it also resolves a conflicted gitlink.
@@ -219,7 +219,7 @@ Implemented (experimental, `git.snapshot-submodules`):
 - Not done yet: the user's global ignores, auto-track patterns and
   `snapshot.max-new-file-size` don't apply inside submodules; nothing
   garbage-collects snapshot commits the superproject no longer refers to;
-  pushing submodule commits has no command yet.
+  snapshot commits have no description and no command sets one.
 
 ### Merging/rebasing with submodules
 
@@ -237,6 +237,24 @@ Only the working-copy commit's gitlink follows the rewrite. Earlier
 superproject commits keep pointing at the pre-rebase submodule commits, so a
 rebase that would leave a conflict in an earlier submodule commit is refused:
 nothing could check that commit out to resolve it.
+
+### Pushing submodule commits
+
+`jj git submodule push <name> --bookmark <bookmark>` pushes the commit the
+working-copy commit's gitlink points at to a bookmark on the submodule's
+`origin`, with the same expected-remote-position check as `jj git push`. The
+superproject is not touched. In the submodule repo the bookmark becomes a
+tracked local bookmark, which is what "pushed from here" means afterwards:
+
+- it follows the commit through later snapshots and rebases, and
+  `jj git submodule push <name>` without `--bookmark` pushes it again;
+- `jj git submodule rebase` treats only ancestors of *untracked* remote
+  bookmarks as off limits, so pushed work can still be rebased;
+- a bookmark that exists on the remote but was never pushed from here (say
+  `main`) is only ever moved forward.
+
+Commits with conflicts are refused, and so are commits without a description
+unless `--allow-empty-description` is given.
 
 TODO: make the superproject commits that refer to rewritten submodule commits
 follow them, and merge diverging gitlinks by merging/rebasing in the
