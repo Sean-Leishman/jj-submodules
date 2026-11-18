@@ -542,3 +542,33 @@ loading anything), load stores lazily, and run nested snapshots in parallel.
   (multi-commit conflicts, describing earlier commits, gitlink merges). Take
   that to #494 before building.
 - Verified on 1.97.1: 1162 CLI tests.
+
+### 2026-11-18 — design: superproject commits follow submodule rewrites (falsifier passed)
+
+- The one remaining problem (multi-commit conflicts, describing earlier
+  commits) reduces to: when submodule commits are rewritten, mutable
+  superproject commits pointing at the old ids must point at the new ones.
+  Main solution, written up as "Proposed" in docs/design/git-submodules.md:
+  id-based gitlink substitution in the same superproject transaction,
+  reparenting (not rebasing) the affected commits.
+- Falsifier `test_git_submodule_follow_rewrites_by_hand`: after a two-commit
+  submodule rebase, do the substitution by hand with `jj git submodule set
+  -r @-` then `set` on `@`. End state is coherent: no conflicts, each commit
+  shows only `M sub`, files follow `jj edit @-` / `jj next --edit`, and `jj
+  op restore` to before the rebase restores both gitlinks and the files.
+- What it also showed: substituting only the parent makes jj's generic
+  descendant rebase produce "2-sided conflict including a git submodule" in
+  the child, and the conflicted gitlink empties the submodule directory. So
+  the implementation must never go through `rebase_descendants()` for
+  submodule paths: substitute every affected commit, reparent.
+- Needs no op-log or backend change, so still ours to build. The part that
+  does need upstream (#494) is automatic merging of diverging gitlinks in the
+  tree merge; left out on purpose.
+- Build plan: (1) `follow_submodule_rewrites(tx, path, old→new)` used by
+  `rebase` and `describe` in place of `set_gitlink` on `@`, dropping rebase's
+  "earlier conflicts" refusal; (2) return the rewrite map from
+  `snapshot_submodules` and apply it in the snapshot transaction, overriding
+  the merged gitlink of descendants; (3) relax the amend rule (drop the wc
+  pointer condition) so `jj edit <earlier>` + edit amends; (4) `describe -r`
+  is then unnecessary (`jj edit` first). Open: submodule commits referenced
+  by immutable superproject commits.

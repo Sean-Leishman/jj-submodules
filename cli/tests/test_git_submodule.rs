@@ -1827,8 +1827,12 @@ fn submodule_has_blob(work_dir: &TestWorkDir<'_>, content: &str) -> bool {
 /// Snapshots the working copy and returns the commit the gitlink at `sub`
 /// points at in `@`.
 fn gitlink(work_dir: &TestWorkDir<'_>) -> String {
+    gitlink_at(work_dir, "@")
+}
+
+fn gitlink_at(work_dir: &TestWorkDir<'_>, revision: &str) -> String {
     let commit_id = work_dir
-        .run_jj(["log", "--no-graph", "-r", "@", "-T", "commit_id"])
+        .run_jj(["log", "--no-graph", "-r", revision, "-T", "commit_id"])
         .success()
         .stdout
         .into_raw();
@@ -2354,4 +2358,118 @@ fn test_git_submodule_push() {
     Deleted submodule "sub"
     [EOF]
     "#);
+}
+
+/// Falsifier for making superproject commits follow rewritten submodule
+/// commits: after a submodule rebase, substitutes the gitlinks of the earlier
+/// superproject commit by hand and checks that the result is coherent.
+#[test]
+fn test_git_submodule_follow_rewrites_by_hand() {
+    let test_env = TestEnvironment::default();
+    let work_dir = set_up_superproject(&test_env);
+    let submodule_dir = test_env.work_dir("submodule");
+    let sub_dir = work_dir.root().join("sub");
+    let files =
+        || ["sub", "added", "other"].map(|name| std::fs::read_to_string(sub_dir.join(name)).ok());
+    let parent_of = |id: &str| submodule_git(&work_dir, &["rev-parse", &format!("{id}^")]);
+    work_dir
+        .run_jj(["git", "submodule", "clone", "sub"])
+        .success();
+
+    // Two superproject commits, each with a submodule commit of its own.
+    std::fs::write(sub_dir.join("sub"), "edited\n").unwrap();
+    work_dir.run_jj(["commit", "-m", "first"]).success();
+    std::fs::write(sub_dir.join("added"), "added\n").unwrap();
+    work_dir.run_jj(["describe", "-m", "second"]).success();
+    let (old_first, old_second) = (gitlink_at(&work_dir, "@-"), gitlink(&work_dir));
+    assert_eq!(parent_of(&old_second), old_first);
+    let before = work_dir.current_operation_id();
+
+    // Upstream moves; the local submodule commits are rebased onto it. Only
+    // the working-copy commit follows today.
+    submodule_dir.write_file("other", "other\n");
+    submodule_dir.run_jj(["commit", "-m", "other"]).success();
+    submodule_dir
+        .run_jj(["bookmark", "move", "main", "--to", "@-"])
+        .success();
+    work_dir.run_jj(["git", "submodule", "fetch"]).success();
+    work_dir
+        .run_jj(["git", "submodule", "rebase", "sub", "-d", "main@origin"])
+        .success();
+    let new_second = gitlink(&work_dir);
+    let new_first = parent_of(&new_second);
+    assert_eq!(gitlink_at(&work_dir, "@-"), old_first);
+
+    // 1. Substituting in the earlier commit: the generic rebase of its
+    // descendant can't merge gitlinks, so that one is substituted too. The
+    // result has no conflicts and each commit points at its own rewrite.
+    let output = work_dir.run_jj(["git", "submodule", "set", "sub", &new_first, "-r", "@-"]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Rebased 1 descendant commits.
+    Working copy  (@) now at: second
+    Parent commit (@-)      : first
+    Added 0 files, modified 1 files, removed 3 files
+    Warning: There are unresolved conflicts at these paths:
+    sub    2-sided conflict including a git submodule
+    New conflicts appeared in 1 commits:
+      second
+    Hint: To resolve the conflicts, start by creating a commit on top of
+    the conflicted commit:
+      jj new nuwvvtmy
+    Then use `jj resolve`, or edit the conflict markers in the file directly.
+    Once the conflicts are resolved, you can inspect the result with `jj diff`.
+    Then run `jj squash` to move the resolution into the conflicted commit.
+    [EOF]
+    ");
+    let output = work_dir.run_jj(["git", "submodule", "set", "sub", &new_second]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Working copy  (@) now at: second
+    Parent commit (@-)      : first
+    Added 3 files, modified 1 files, removed 0 files
+    Existing conflicts were resolved or abandoned from 1 commits.
+    [EOF]
+    ");
+    assert_eq!(gitlink_at(&work_dir, "@-"), new_first);
+    assert_eq!(gitlink(&work_dir), new_second);
+    let output = work_dir.run_jj(["log", "-r", "::@ & conflicts()"]);
+    insta::assert_snapshot!(output, @"");
+    let output = work_dir.run_jj([
+        "log",
+        "--no-graph",
+        "-r",
+        "@- | @",
+        "-T",
+        "description",
+        "-s",
+    ]);
+    insta::assert_snapshot!(output, @"
+    second
+    M sub
+    first
+    M sub
+    [EOF]
+    ");
+
+    // 2. The submodule's files follow whichever commit is edited.
+    let some = |content: &str| Some(content.to_owned());
+    assert_eq!(
+        files(),
+        [some("edited\n"), some("added\n"), some("other\n")]
+    );
+    work_dir.run_jj(["edit", "@-"]).success();
+    assert_eq!(files(), [some("edited\n"), None, some("other\n")]);
+    work_dir.run_jj(["next", "--edit"]).success();
+    assert_eq!(
+        files(),
+        [some("edited\n"), some("added\n"), some("other\n")]
+    );
+
+    // 3. Going back to before the rebase restores both commits' gitlinks and
+    // the files.
+    work_dir.run_jj(["op", "restore", &before]).success();
+    assert_eq!(gitlink_at(&work_dir, "@-"), old_first);
+    assert_eq!(gitlink(&work_dir), old_second);
+    assert_eq!(files(), [some("edited\n"), some("added\n"), None]);
 }

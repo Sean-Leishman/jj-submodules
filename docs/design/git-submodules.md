@@ -261,6 +261,39 @@ same rule as snapshots: not if the commit is on an untracked remote bookmark
 or a parent of the working-copy commit refers to it. So a submodule commit is
 described before the superproject change that contains it is committed.
 
-TODO: make the superproject commits that refer to rewritten submodule commits
-follow them, and merge diverging gitlinks by merging/rebasing in the
-submodule instead of reporting a gitlink conflict.
+#### Proposed: superproject commits follow submodule rewrites
+
+Whenever a transaction on a submodule repo rewrites commits (rebase,
+describe, a snapshot that amends a commit with descendants), it yields a map
+from old to new submodule commit ids. In the same superproject transaction,
+every *mutable* superproject commit whose tree has a gitlink at the
+submodule's path pointing at an old id gets that gitlink replaced by the new
+id.
+
+- This is a substitution, not a rebase. The generic rebase of a descendant
+  merges trees, and a three-way merge of gitlinks whose base and both sides
+  differ is a conflict (verified by hand: substituting in a parent leaves its
+  child with "2-sided conflict including a git submodule" and an emptied
+  submodule directory until the child is substituted too). So the rewritten
+  commits are reparented with their own trees, in which only the gitlink is
+  replaced.
+- Immutable superproject commits are left alone; the old submodule commits
+  stay in the submodule's store for them and for the operation log.
+- With that in place, the rule for what a snapshot may rewrite no longer
+  needs the working-copy pointer: a submodule commit is rewritten in place
+  unless it is an ancestor of an untracked remote bookmark, isn't in the
+  submodule repo's index (fetched by hash), or a parent of the working-copy
+  commit has that gitlink. `jj edit <earlier commit>` then lets the
+  submodule's files of that commit be edited: the snapshot rewrites its
+  submodule commit, the submodule repo rebases the later local commits on
+  top, and the later superproject commits are substituted. That is how a
+  conflict in, or the description of, an earlier local submodule commit is
+  fixed.
+- Open: a submodule commit that an *immutable* superproject commit refers to
+  should count as immutable too. Scanning all history for gitlinks is too
+  slow; treating ancestors of the gitlinks of `immutable_heads()` as
+  immutable covers a submodule whose pointer only moves forward.
+- Not covered: merging diverging gitlinks during a superproject rebase or
+  merge (it stays a gitlink conflict, resolved with `jj git submodule set`).
+  Doing that automatically means teaching the tree merge about submodules,
+  which is a core change to discuss upstream.
