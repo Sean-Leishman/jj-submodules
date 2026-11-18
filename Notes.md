@@ -634,3 +634,23 @@ Revised split (one commit each, tests in each, docs as they land):
     descendants of `@` following, together; neither is testable or safe
     alone. Tests: edit-earlier amend; edit-earlier child case;
     undo-then-edit; conflict in earlier commit → `jj edit` → resolve → push.
+
+### 2026-11-18 — follow-rewrites step A: `rebase` and `describe`
+
+- `mutable_gitlinks()` scans `mutable()` once for gitlinks at the submodule
+  path; `start_submodule_rewrite()` makes those submodule commits visible in
+  the submodule transaction (fixes the undo-then-rebase-again bug: now
+  "Rebased 2 commits" again); `follow_submodule_rewrites()` substitutes via
+  `transform_descendants` + `reparent().set_tree()`.
+- `describe` collects its map from `rebase_descendants_with_options`'
+  progress callback, so `jj edit @-` + `submodule describe` describes an
+  earlier commit and the later ones follow in both repos.
+- Kept on purpose until step E: rebase's "conflicts in earlier commits"
+  refusal (nothing can resolve them before snapshots can amend an earlier
+  commit) and describe's "a parent refers to it" refusal.
+- Side effect to remember: rebasing after an undo makes the old (hidden)
+  commits visible and rewrites them again, so the submodule repo ends up with
+  divergent change ids next to the orphans of the undone rebase. Cosmetic;
+  nothing of ours reads change ids.
+- Superproject op is now "rebase submodule <name> onto <id>" / "describe
+  commit <id> of submodule <name>". 1163 CLI tests pass.

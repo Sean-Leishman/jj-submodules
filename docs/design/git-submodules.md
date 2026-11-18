@@ -233,35 +233,13 @@ materialized in the submodule's files and resolved by editing them (the next
 snapshot rewrites the commit); `jj status` reports the submodule as having
 conflicts.
 
-Only the working-copy commit's gitlink follows the rewrite. Earlier
-superproject commits keep pointing at the pre-rebase submodule commits, so a
-rebase that would leave a conflict in an earlier submodule commit is refused:
-nothing could check that commit out to resolve it.
+Every mutable superproject commit follows the rewrite (see below), for
+`rebase` and `describe`. A rebase that would leave a conflict in an earlier
+submodule commit is still refused: snapshots can't yet rewrite the submodule
+commit of an earlier superproject commit that is being edited, so the
+conflict couldn't be resolved.
 
-### Pushing submodule commits
-
-`jj git submodule push <name> --bookmark <bookmark>` pushes the commit the
-working-copy commit's gitlink points at to a bookmark on the submodule's
-`origin`, with the same expected-remote-position check as `jj git push`. The
-superproject is not touched. In the submodule repo the bookmark becomes a
-tracked local bookmark, which is what "pushed from here" means afterwards:
-
-- it follows the commit through later snapshots and rebases, and
-  `jj git submodule push <name>` without `--bookmark` pushes it again;
-- `jj git submodule rebase` treats only ancestors of *untracked* remote
-  bookmarks as off limits, so pushed work can still be rebased;
-- a bookmark that exists on the remote but was never pushed from here (say
-  `main`) is only ever moved forward.
-
-Commits with conflicts are refused, and so are commits without a description
-unless `--allow-empty-description` is given. Snapshot commits start without
-one; `jj git submodule describe <name> -m <message>` sets it on the commit the
-working-copy commit's gitlink points at (later snapshots keep it), under the
-same rule as snapshots: not if the commit is on an untracked remote bookmark
-or a parent of the working-copy commit refers to it. So a submodule commit is
-described before the superproject change that contains it is committed.
-
-#### Proposed: superproject commits follow submodule rewrites
+#### Superproject commits follow submodule rewrites (in progress)
 
 Whenever a transaction on a submodule repo rewrites commits (rebase,
 describe, a snapshot that amends a commit with descendants), it yields a map
@@ -269,6 +247,13 @@ from old to new submodule commit ids. In the same superproject transaction,
 every *mutable* superproject commit whose tree has a gitlink at the
 submodule's path pointing at an old id gets that gitlink replaced by the new
 id.
+
+Done for `rebase` and `describe`; the items about snapshots below are not
+implemented yet. The superproject, not the submodule repo, decides which
+submodule commits matter: before rewriting, the commits that mutable
+superproject commits point at are made visible in the submodule repo, since
+an undone rewrite leaves the superproject pointing at commits the submodule
+repo has hidden, and a rewrite only carries visible descendants along.
 
 - This is a substitution, not a rebase. The generic rebase of a descendant
   merges trees, and a three-way merge of gitlinks whose base and both sides

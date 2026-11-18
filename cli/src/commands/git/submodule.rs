@@ -21,6 +21,7 @@ use futures::TryStreamExt as _;
 
 use clap::Subcommand;
 use itertools::Itertools as _;
+use jj_lib::backend::BackendError;
 use jj_lib::backend::CommitId;
 use jj_lib::backend::TreeValue;
 use jj_lib::commit::Commit;
@@ -51,6 +52,7 @@ use jj_lib::rewrite::MoveCommitsTarget;
 use jj_lib::rewrite::RebaseOptions;
 use jj_lib::rewrite::RebasedCommit;
 use jj_lib::rewrite::move_commits;
+use jj_lib::transaction::Transaction;
 
 use crate::cli_util::CommandHelper;
 use crate::cli_util::LogContentFormat;
@@ -751,69 +753,82 @@ async fn cmd_submodule_rebase(
         submodule_revset(ui, command, &workspace_command, &sub_repo, &revision).await
     };
     let roots = evaluate(format!("roots({onto}..{old})")).await?;
-    let new_id = if roots.is_empty() {
+    if roots.is_empty() {
         // Nothing local: the old commit is the destination or an ancestor.
-        onto_id
-    } else {
-        // Bookmarks pushed from here are tracked and may be rewritten.
-        if !evaluate(format!("({onto}..{old}) & ::untracked_remote_bookmarks()"))
-            .await?
-            .is_empty()
-        {
-            return Err(user_error(format!(
-                "Commits of submodule {name:?} that are on a remote would be rebased"
-            ))
-            .hinted(format!(
-                "`jj git submodule set {name}` can point the gitlink at another commit."
-            )));
+        if onto_id == old_id {
+            writeln!(ui.status(), "Nothing changed.")?;
+            return Ok(());
         }
-        let mut tx = sub_repo.start_transaction();
-        let stats = move_commits(
-            tx.repo_mut(),
-            &MoveCommitsLocation {
-                new_parent_ids: vec![onto_id],
-                new_child_ids: vec![],
-                target: MoveCommitsTarget::Roots(roots),
-            },
-            &RebaseOptions::default(),
-        )
-        .await?;
-        tx.repo_mut().rebase_descendants().await?;
-        let new_id = match stats.rebased_commits.get(&old_id) {
-            Some(RebasedCommit::Rewritten(commit)) => commit.id().clone(),
-            Some(RebasedCommit::Abandoned { parent_id }) => parent_id.clone(),
-            None => old_id.clone(),
-        };
-        // ponytail: only the tip is checked out, so only its conflicts can be
-        // resolved. Lifting this needs the superproject commits that refer
-        // to the earlier submodule commits to follow the rewrite.
-        let stuck = stats.rebased_commits.values().any(|rebased| match rebased {
-            RebasedCommit::Rewritten(commit) => commit.id() != &new_id && commit.has_conflict(),
-            RebasedCommit::Abandoned { .. } => false,
-        });
-        if stuck {
-            return Err(user_error(format!(
-                "Rebasing would leave conflicts in earlier commits of submodule {name:?}, which \
-                 can't be resolved yet"
-            )));
-        }
-        if tx.repo().has_changes() {
-            tx.commit(format!("rebase submodule commits onto {onto}"))
-                .await?;
-        }
-        writeln!(
-            ui.status(),
-            "Rebased {} commits of submodule {name:?}",
-            stats.num_rebased_targets + stats.num_rebased_descendants
-        )?;
-        new_id
-    };
-    if new_id == old_id {
+        return set_gitlink(ui, &mut workspace_command, &commit, &config, &onto_id).await;
+    }
+    // Bookmarks pushed from here are tracked and may be rewritten.
+    if !evaluate(format!("({onto}..{old}) & ::untracked_remote_bookmarks()"))
+        .await?
+        .is_empty()
+    {
+        return Err(user_error(format!(
+            "Commits of submodule {name:?} that are on a remote would be rebased"
+        ))
+        .hinted(format!(
+            "`jj git submodule set {name}` can point the gitlink at another commit."
+        )));
+    }
+    let gitlinks = mutable_gitlinks(ui, &workspace_command, &config.path).await?;
+    let mut tx = start_submodule_rewrite(&sub_repo, &gitlinks).await?;
+    let stats = move_commits(
+        tx.repo_mut(),
+        &MoveCommitsLocation {
+            new_parent_ids: vec![onto_id],
+            new_child_ids: vec![],
+            target: MoveCommitsTarget::Roots(roots),
+        },
+        &RebaseOptions::default(),
+    )
+    .await?;
+    tx.repo_mut().rebase_descendants().await?;
+    let rewrites: HashMap<CommitId, CommitId> = stats
+        .rebased_commits
+        .iter()
+        .map(|(old_id, rebased)| match rebased {
+            RebasedCommit::Rewritten(commit) => (old_id.clone(), commit.id().clone()),
+            RebasedCommit::Abandoned { parent_id } => (old_id.clone(), parent_id.clone()),
+        })
+        .collect();
+    let Some(new_id) = rewrites.get(&old_id) else {
         writeln!(ui.status(), "Nothing changed.")?;
         return Ok(());
+    };
+    // ponytail: only the tip is checked out, so only its conflicts can be
+    // resolved. Lifting this needs snapshots made while an earlier
+    // superproject commit is edited to rewrite its submodule commit.
+    let stuck = stats.rebased_commits.values().any(|rebased| match rebased {
+        RebasedCommit::Rewritten(commit) => commit.id() != new_id && commit.has_conflict(),
+        RebasedCommit::Abandoned { .. } => false,
+    });
+    if stuck {
+        return Err(user_error(format!(
+            "Rebasing would leave conflicts in earlier commits of submodule {name:?}, which \
+             can't be resolved yet"
+        )));
     }
-    set_gitlink(ui, &mut workspace_command, &commit, &config, &new_id).await?;
-    if sub_repo.store().get_commit(&new_id)?.has_conflict() {
+    tx.commit(format!("rebase submodule commits onto {onto}"))
+        .await?;
+    writeln!(
+        ui.status(),
+        "Rebased {} commits of submodule {name:?}",
+        rewrites.len()
+    )?;
+    let description = format!("rebase submodule {name} onto {onto}");
+    follow_submodule_rewrites(
+        ui,
+        &mut workspace_command,
+        &config,
+        &gitlinks,
+        &rewrites,
+        description,
+    )
+    .await?;
+    if sub_repo.store().get_commit(new_id)?.has_conflict() {
         writeln!(
             ui.warning_default(),
             "Submodule {name:?} now has conflicts; resolve them in its files."
@@ -865,22 +880,36 @@ async fn cmd_submodule_describe(
         writeln!(ui.status(), "Nothing changed.")?;
         return Ok(());
     }
-    let mut tx = sub_repo.start_transaction();
+    let gitlinks = mutable_gitlinks(ui, &workspace_command, &config.path).await?;
+    let mut tx = start_submodule_rewrite(&sub_repo, &gitlinks).await?;
     let new_commit = tx
         .repo_mut()
         .rewrite_commit(&old_commit)
         .set_description(description)
         .write()
         .await?;
-    tx.repo_mut().rebase_descendants().await?;
+    let mut rewrites = HashMap::from([(old_id.clone(), new_commit.id().clone())]);
+    tx.repo_mut()
+        .rebase_descendants_with_options(
+            &RevsetExpression::none(),
+            &RebaseOptions::default(),
+            |old_commit, rebased| {
+                if let RebasedCommit::Rewritten(new_commit) = rebased {
+                    rewrites.insert(old_commit.id().clone(), new_commit.id().clone());
+                }
+            },
+        )
+        .await?;
     tx.commit(format!("describe commit {}", old_id.hex()))
         .await?;
-    set_gitlink(
+    let description = format!("describe commit {} of submodule {name}", old_id.hex());
+    follow_submodule_rewrites(
         ui,
         &mut workspace_command,
-        &commit,
         &config,
-        new_commit.id(),
+        &gitlinks,
+        &rewrites,
+        description,
     )
     .await
 }
@@ -1049,6 +1078,100 @@ async fn working_copy_gitlink(
         )));
     }
     Ok((commit, config, gitlink, sub_repo))
+}
+
+/// The mutable superproject commits with a gitlink at `path`, each with the
+/// submodule commits it points at (several if the gitlink is conflicted).
+async fn mutable_gitlinks(
+    ui: &Ui,
+    workspace_command: &WorkspaceCommandHelper,
+    path: &RepoPath,
+) -> Result<Vec<(CommitId, Vec<CommitId>)>, CommandError> {
+    let mut commits = workspace_command
+        .parse_revset(ui, &RevisionArg::from("mutable()".to_owned()))?
+        .evaluate_to_commits()?;
+    let mut gitlinks = vec![];
+    while let Some(commit) = commits.try_next().await? {
+        let value = commit.tree().path_value(path).await?;
+        let ids = value
+            .iter()
+            .filter_map(|term| match term {
+                Some(TreeValue::GitSubmodule(id)) => Some(id.clone()),
+                _ => None,
+            })
+            .collect_vec();
+        if !ids.is_empty() {
+            gitlinks.push((commit.id().clone(), ids));
+        }
+    }
+    Ok(gitlinks)
+}
+
+/// Starts a transaction on the submodule repo for rewriting its commits.
+///
+/// The superproject, not the submodule repo, knows which commits matter: an
+/// undone rewrite leaves it pointing at commits the submodule repo has
+/// hidden, and a rewrite only carries visible descendants along. So the
+/// commits the superproject's mutable commits point at are made visible
+/// first.
+async fn start_submodule_rewrite(
+    sub_repo: &Arc<ReadonlyRepo>,
+    gitlinks: &[(CommitId, Vec<CommitId>)],
+) -> Result<Transaction, CommandError> {
+    let mut tx = sub_repo.start_transaction();
+    for id in gitlinks.iter().flat_map(|(_, ids)| ids).unique() {
+        // Commits fetched by hash are in the store but not in the index.
+        if tx.repo().index().has_id(id).await? {
+            let commit = tx.repo().store().get_commit(id)?;
+            tx.repo_mut().add_head(&commit).await?;
+        }
+    }
+    Ok(tx)
+}
+
+/// Points the gitlinks of submodule `config` in the superproject's mutable
+/// commits (`gitlinks`) at the rewritten submodule commits.
+///
+/// The affected commits keep their own trees with just the gitlink replaced:
+/// rebasing them would merge the gitlinks of parent and child, which is a
+/// conflict whenever both changed.
+async fn follow_submodule_rewrites(
+    ui: &Ui,
+    workspace_command: &mut WorkspaceCommandHelper,
+    config: &SubmoduleConfig,
+    gitlinks: &[(CommitId, Vec<CommitId>)],
+    rewrites: &HashMap<CommitId, CommitId>,
+    description: String,
+) -> Result<(), CommandError> {
+    let roots = gitlinks
+        .iter()
+        .filter(|(_, ids)| ids.iter().any(|id| rewrites.contains_key(id)))
+        .map(|(commit_id, _)| commit_id.clone())
+        .collect();
+    let mut tx = workspace_command.start_transaction();
+    tx.repo_mut()
+        .transform_descendants(roots, async |rewriter| {
+            let old_tree = rewriter.old_commit().tree();
+            let old_value = old_tree.path_value(&config.path).await?;
+            let new_value = old_value.map(|term| match term {
+                Some(TreeValue::GitSubmodule(id)) => Some(TreeValue::GitSubmodule(
+                    rewrites.get(id).unwrap_or(id).clone(),
+                )),
+                _ => term.clone(),
+            });
+            if new_value == old_value && !rewriter.parents_changed() {
+                return Ok(());
+            }
+            let mut tree_builder = MergedTreeBuilder::new(old_tree);
+            tree_builder
+                .set_or_remove_merge(config.path.clone(), new_value)
+                .map_err(|err| BackendError::Other(err.into()))?;
+            let new_tree = tree_builder.write_tree().await?;
+            rewriter.reparent().set_tree(new_tree).write().await?;
+            Ok(())
+        })
+        .await?;
+    tx.finish(ui, description).await
 }
 
 /// Rewrites `commit` so the gitlink of submodule `config` points at
