@@ -19,10 +19,13 @@
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fs;
+use std::pin::pin;
 use std::sync::Arc;
 
 use futures::AsyncReadExt as _;
+use futures::TryStreamExt as _;
 use thiserror::Error;
 
 use crate::backend::BackendError;
@@ -49,6 +52,8 @@ use crate::git_backend::GitBackend;
 use crate::git_subprocess::GitSubprocessContext;
 use crate::merged_tree::MergedTree;
 use crate::object_id::ObjectId as _;
+use crate::op_store::OpStoreResult;
+use crate::op_walk;
 use crate::ref_name::RemoteName;
 use crate::repo::BackendInitializer;
 use crate::repo::ReadonlyRepo;
@@ -350,6 +355,31 @@ pub async fn fetch_submodule(
         .cloned()
         .collect();
     Ok((stats, still_missing))
+}
+
+/// The subset of `ids` that transactions on `repo`, a submodule repo, wrote
+/// themselves, as opposed to fetched. Only those are ours to rewrite: neither
+/// a tracked remote bookmark nor being on no bookmark at all says who made a
+/// commit.
+// ponytail: walks the operation log until every id is found, so all of it
+// for a commit that wasn't made here. Keep a set of locally written commits
+// if that shows up in profiles.
+pub async fn locally_written(
+    repo: &ReadonlyRepo,
+    ids: impl IntoIterator<Item = CommitId>,
+) -> OpStoreResult<HashSet<CommitId>> {
+    let mut wanted: HashSet<CommitId> = ids.into_iter().collect();
+    let mut found = HashSet::new();
+    let mut ops = pin!(op_walk::walk_ancestors(std::slice::from_ref(
+        repo.operation()
+    )));
+    while !wanted.is_empty()
+        && let Some(op) = ops.try_next().await?
+    {
+        // Imports don't record the commits they bring in; commit builders do.
+        found.extend(wanted.extract_if(|id| op.predecessors_for_commit(id).is_some()));
+    }
+    Ok(found)
 }
 
 #[cfg(test)]

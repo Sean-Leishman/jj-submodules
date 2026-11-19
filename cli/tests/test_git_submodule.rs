@@ -2174,19 +2174,6 @@ fn test_git_submodule_rebase() {
     [exit status: 1]
     "#);
     assert_eq!(gitlink(&work_dir), resolved);
-
-    // Commits that are on a remote are never rebased.
-    work_dir
-        .run_jj(["git", "submodule", "set", "sub", "main@origin"])
-        .success();
-    let output = work_dir.run_jj(["git", "submodule", "rebase", "sub", "-d", "main@origin-"]);
-    insta::assert_snapshot!(output, @r#"
-    ------- stderr -------
-    Error: Commits of submodule "sub" that are on a remote would be rebased
-    Hint: `jj git submodule set sub` can point the gitlink at another commit.
-    [EOF]
-    [exit status: 1]
-    "#);
 }
 
 /// `jj git submodule describe` and `push` publish snapshot commits to a
@@ -2221,7 +2208,7 @@ fn test_git_submodule_push() {
     // Upstream's commits aren't ours to describe.
     insta::assert_snapshot!(describe(), @r#"
     ------- stderr -------
-    Error: Won't describe commit [id] of submodule "sub" since it is on a remote
+    Error: Won't describe commit [id] of submodule "sub" since it is referred to by a parent of the working-copy commit
     [EOF]
     [exit status: 1]
     "#);
@@ -2339,6 +2326,31 @@ fn test_git_submodule_push() {
         std::fs::read_to_string(clone_dir.root().join("sub/sub")).unwrap(),
         "resolved\n"
     );
+
+    // Having pushed to a bookmark doesn't make the commits on it ours to
+    // rewrite: upstream's stay where they are.
+    insta::assert_snapshot!(push(&["-b", "main"]), @r#"
+    ------- stderr -------
+    Pushed commit [id] of submodule "sub" to main@origin
+    [EOF]
+    "#);
+    submodule_dir.run_jj(["new", "root()+"]).success();
+    submodule_dir.write_file("side", "side\n");
+    submodule_dir.run_jj(["commit", "-m", "side"]).success();
+    submodule_dir
+        .run_jj(["bookmark", "create", "side", "-r", "@-"])
+        .success();
+    work_dir.run_jj(["git", "submodule", "fetch"]).success();
+    let output = work_dir
+        .run_jj(["git", "submodule", "rebase", "sub", "-d", "side@origin"])
+        .normalize_stderr_with(hide_ids);
+    insta::assert_snapshot!(output, @r#"
+    ------- stderr -------
+    Error: Won't rewrite commit [id] of submodule "sub" since it was not made here
+    Hint: `jj git submodule set sub` can point the gitlink at another commit.
+    [EOF]
+    [exit status: 1]
+    "#);
 
     // Once a superproject commit refers to the submodule commit, it is
     // history.

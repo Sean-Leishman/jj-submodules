@@ -654,3 +654,22 @@ Revised split (one commit each, tests in each, docs as they land):
   nothing of ours reads change ids.
 - Superproject op is now "rebase submodule <name> onto <id>" / "describe
   commit <id> of submodule <name>". 1163 CLI tests pass.
+
+### 2026-11-19 — follow-rewrites step B: ownership from the op log
+
+- `git_submodule::locally_written(repo, ids)`: walks the submodule repo's
+  operation log for ops whose `commit_predecessors` has the id as a key.
+  Commit builders record every commit they write there; `import_refs` with
+  `record_synthetic_predecessors: false` (what `fetch_submodule` uses)
+  records nothing. Exact, and cheap for our own commits (recent ops); a
+  commit that isn't ours costs a walk of the whole op log.
+- `rebase` and `describe` now check the *actual* rewrite map with it before
+  committing the submodule transaction (`check_locally_written`), which also
+  covers descendants carried along. The `::untracked_remote_bookmarks()`
+  guards are gone.
+- Test for the hole the review found: after `push -b main` (tracked now),
+  rebasing onto an upstream side branch would have rewritten upstream's
+  commit under `main`; refused with "was not made here".
+- Rebasing onto an ancestor is a no-op ("Nothing changed."), so the old
+  refusal test (`set main@origin`, rebase onto `main@origin-`) was testing
+  the guard's position, not a rewrite; removed.

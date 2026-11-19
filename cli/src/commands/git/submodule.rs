@@ -125,8 +125,8 @@ pub struct SubmoduleDeleteArgs {
 /// Describes the submodule commit the working-copy commit's gitlink points
 /// at, typically a snapshot of changes made in the submodule's directory, and
 /// points the gitlink at the result. Later snapshots keep the description.
-/// Commits that are on a remote, or that a parent of the working-copy commit
-/// refers to, are not rewritten.
+/// Commits that were fetched rather than made here, or that a parent of the
+/// working-copy commit refers to, are not rewritten.
 #[derive(clap::Args, Clone, Debug)]
 pub struct SubmoduleDescribeArgs {
     /// Name of the submodule
@@ -210,7 +210,8 @@ pub struct SubmodulePushArgs {
 /// gitlink and aren't ancestors of the destination (typically snapshots of
 /// changes made in the submodule's directory) onto the destination, and
 /// points the gitlink at the result. Without such commits, the gitlink just
-/// moves to the destination. Commits that are on a remote are not rebased.
+/// moves to the destination. Commits that were fetched rather than made here
+/// are not rebased.
 #[derive(clap::Args, Clone, Debug)]
 pub struct SubmoduleRebaseArgs {
     /// Name of the submodule
@@ -761,18 +762,6 @@ async fn cmd_submodule_rebase(
         }
         return set_gitlink(ui, &mut workspace_command, &commit, &config, &onto_id).await;
     }
-    // Bookmarks pushed from here are tracked and may be rewritten.
-    if !evaluate(format!("({onto}..{old}) & ::untracked_remote_bookmarks()"))
-        .await?
-        .is_empty()
-    {
-        return Err(user_error(format!(
-            "Commits of submodule {name:?} that are on a remote would be rebased"
-        ))
-        .hinted(format!(
-            "`jj git submodule set {name}` can point the gitlink at another commit."
-        )));
-    }
     let gitlinks = mutable_gitlinks(ui, &workspace_command, &config.path).await?;
     let mut tx = start_submodule_rewrite(&sub_repo, &gitlinks).await?;
     let stats = move_commits(
@@ -798,6 +787,7 @@ async fn cmd_submodule_rebase(
         writeln!(ui.status(), "Nothing changed.")?;
         return Ok(());
     };
+    check_locally_written(&sub_repo, name, &rewrites).await?;
     // ponytail: only the tip is checked out, so only its conflicts can be
     // resolved. Lifting this needs snapshots made while an earlier
     // superproject commit is edited to rewrite its submodule commit.
@@ -847,32 +837,17 @@ async fn cmd_submodule_describe(
     let (commit, config, old_id, sub_repo) =
         working_copy_gitlink(ui, command, &workspace_command, name).await?;
     workspace_command.check_rewritable([commit.id()]).await?;
-    // Same rule as for snapshots: what others or the superproject's history
-    // refer to stays as it is.
-    let on_remote = RevisionArg::from(format!("{} & ::untracked_remote_bookmarks()", old_id.hex()));
-    let reason = if !submodule_revset(ui, command, &workspace_command, &sub_repo, &on_remote)
-        .await?
-        .is_empty()
-    {
-        Some("is on a remote")
-    } else {
-        let old_value = Some(TreeValue::GitSubmodule(old_id.clone()));
-        let mut in_parent = false;
-        for parent in commit.parents().await? {
-            in_parent |= parent
-                .tree()
-                .path_value(&config.path)
-                .await?
-                .iter()
-                .contains(&old_value);
+    // What the superproject's history refers to stays as it is.
+    let old_value = Some(TreeValue::GitSubmodule(old_id.clone()));
+    for parent in commit.parents().await? {
+        let value = parent.tree().path_value(&config.path).await?;
+        if value.iter().contains(&old_value) {
+            return Err(user_error(format!(
+                "Won't describe commit {} of submodule {name:?} since it is referred to by a \
+                 parent of the working-copy commit",
+                short_commit_hash(&old_id)
+            )));
         }
-        in_parent.then_some("is referred to by a parent of the working-copy commit")
-    };
-    if let Some(reason) = reason {
-        return Err(user_error(format!(
-            "Won't describe commit {} of submodule {name:?} since it {reason}",
-            short_commit_hash(&old_id)
-        )));
     }
     let old_commit = sub_repo.store().get_commit(&old_id)?;
     let description = join_message_paragraphs(&args.message_paragraphs);
@@ -900,6 +875,7 @@ async fn cmd_submodule_describe(
             },
         )
         .await?;
+    check_locally_written(&sub_repo, name, &rewrites).await?;
     tx.commit(format!("describe commit {}", old_id.hex()))
         .await?;
     let description = format!("describe commit {} of submodule {name}", old_id.hex());
@@ -1078,6 +1054,27 @@ async fn working_copy_gitlink(
         )));
     }
     Ok((commit, config, gitlink, sub_repo))
+}
+
+/// Refuses to replace submodule commits that were fetched rather than made
+/// here. Called with what a submodule transaction rewrote, before it is
+/// committed.
+async fn check_locally_written(
+    sub_repo: &ReadonlyRepo,
+    name: &str,
+    rewrites: &HashMap<CommitId, CommitId>,
+) -> Result<(), CommandError> {
+    let local = git_submodule::locally_written(sub_repo, rewrites.keys().cloned()).await?;
+    if let Some(id) = rewrites.keys().find(|id| !local.contains(id)) {
+        return Err(user_error(format!(
+            "Won't rewrite commit {} of submodule {name:?} since it was not made here",
+            short_commit_hash(id)
+        ))
+        .hinted(format!(
+            "`jj git submodule set {name}` can point the gitlink at another commit."
+        )));
+    }
+    Ok(())
 }
 
 /// The mutable superproject commits with a gitlink at `path`, each with the
