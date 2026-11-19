@@ -227,8 +227,13 @@ Partly implemented: `jj git submodule rebase <name> --onto <revset>` updates
 a submodule that has local commits. It rebases the commits in
 `<onto>..<gitlink of @>` onto the destination in a transaction on the
 submodule repo and points the working-copy commit's gitlink at the result;
-with no such commits the gitlink just moves. Commits that are ancestors of a
-remote bookmark are never rebased. A conflict in the last commit is
+with no such commits the gitlink just moves. Only commits made here are
+rewritten, by `rebase`, `describe` or anything else: those that a transaction
+on the submodule repo wrote, which its operation log records, as opposed to
+fetched ones. Bookmarks can't tell: pushing to `main` makes it a tracked
+bookmark without making upstream's commits on it ours, tags aren't bookmarks,
+and the commits of a branch deleted upstream are on none. Pushed work of ours
+can still be rebased. A conflict in the last commit is
 materialized in the submodule's files and resolved by editing them (the next
 snapshot rewrites the commit); `jj status` reports the submodule as having
 conflicts.
@@ -266,9 +271,8 @@ repo has hidden, and a rewrite only carries visible descendants along.
   stay in the submodule's store for them and for the operation log.
 - With that in place, the rule for what a snapshot may rewrite no longer
   needs the working-copy pointer: a submodule commit is rewritten in place
-  unless it is an ancestor of an untracked remote bookmark, isn't in the
-  submodule repo's index (fetched by hash), or a parent of the working-copy
-  commit has that gitlink. `jj edit <earlier commit>` then lets the
+  unless it wasn't made here or a parent of the working-copy commit has that
+  gitlink. `jj edit <earlier commit>` then lets the
   submodule's files of that commit be edited: the snapshot rewrites its
   submodule commit, the submodule repo rebases the later local commits on
   top, and the later superproject commits are substituted. That is how a
@@ -282,3 +286,24 @@ repo has hidden, and a rewrite only carries visible descendants along.
   merge (it stays a gitlink conflict, resolved with `jj git submodule set`).
   Doing that automatically means teaching the tree merge about submodules,
   which is a core change to discuss upstream.
+
+### Pushing submodule commits
+
+`jj git submodule push <name> --bookmark <bookmark>` pushes the commit the
+working-copy commit's gitlink points at to a bookmark on the submodule's
+`origin`, with the same expected-remote-position check as `jj git push`. The
+superproject is not touched. In the submodule repo the bookmark becomes a
+tracked local bookmark, which is what "pushed from here" means afterwards:
+
+- it follows the commit through later snapshots and rebases, and
+  `jj git submodule push <name>` without `--bookmark` pushes it again;
+- a bookmark that exists on the remote but was never pushed from here (say
+  `main`) is only ever moved forward.
+
+Commits with conflicts are refused, and so are commits without a description
+unless `--allow-empty-description` is given. Snapshot commits start without
+one; `jj git submodule describe <name> -m <message>` sets it on the commit the
+working-copy commit's gitlink points at (later snapshots keep it), under the
+same rule as snapshots: not if the commit wasn't made here or a parent of the
+working-copy commit refers to it. So a submodule commit is
+described before the superproject change that contains it is committed.
