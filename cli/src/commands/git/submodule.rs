@@ -76,9 +76,10 @@ use crate::ui::Ui;
 /// EXPERIMENTAL: Manage the Git submodules of this repo
 ///
 /// Submodule repos are stored inside the superproject's `.jj` directory and
-/// have no working copy of their own. Submodule support is read-only:
-/// submodule contents can be populated in the working copy, but changes made
-/// inside a submodule directory are not snapshotted.
+/// have no working copy of their own. Submodule contents are populated in the
+/// superproject's working copy, and changes made inside a submodule directory
+/// are snapshotted into a commit of the submodule (see
+/// `git.snapshot-submodules`).
 #[derive(Subcommand, Clone, Debug)]
 #[command(hide = true)]
 pub enum GitSubmoduleCommand {

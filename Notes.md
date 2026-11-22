@@ -744,3 +744,19 @@ Revised split (one commit each, tests in each, docs as they land):
   after C–E (the unchanged path is still only the parallel stat walk);
   `jj status` reports conflicts only for `@`'s submodule commit; merging
   diverging gitlinks in the tree merge is still the #494 question.
+
+### 2026-11-22 — status write-up and by-hand verification
+
+- `Todo.md` now lists what is done (with the test that proves each item) and
+  what is left. Re-ran the 22 submodule tests and a by-hand run against real
+  Git repos (clone, snapshot, describe, fetch + rebase, undo/redo, push, `git
+  clone --recurse-submodules` of the pushed superproject, immutable refusal,
+  edit-earlier, knob off/on).
+- Found by hand, fixed: `jj git submodule --help` and the changelog still
+  said "read-only".
+- Found by hand, not fixed (in `Todo.md`): `submodule log` draws every commit
+  but the checked-out one as immutable; a submodule left dirty with the knob
+  off stays unsnapshotted with it on until you return to the commit the
+  directory came from (then it snapshots normally).
+- Confirmed by hand: divergent change ids in the submodule repo after
+  undo-then-edit.

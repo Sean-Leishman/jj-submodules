@@ -181,7 +181,7 @@ and this project adheres to
 * The hunk headers of `diff.color-words.conflict = "pair"` now include the
   conflict labels of the compared terms.
 
-* Experimental read-only Git submodule support. `jj git clone` clones the
+* Experimental Git submodule support. `jj git clone` clones the
   submodules declared in `.gitmodules` into the jj repo and `jj git fetch`
   fetches them (see `git.clone-submodules` and `git.fetch-submodules`), after
   which checking out a commit populates their directories with the gitlinked
