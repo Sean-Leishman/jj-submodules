@@ -673,3 +673,24 @@ Revised split (one commit each, tests in each, docs as they land):
 - Rebasing onto an ancestor is a no-op ("Nothing changed."), so the old
   refusal test (`set main@origin`, rebase onto `main@origin-`) was testing
   the guard's position, not a rewrite; removed.
+
+### 2026-11-22 — follow-rewrites step C: commits move out of the working copy
+
+- `LockedWorkingCopy::snapshot_submodules()` now only snapshots the nested
+  tree states and returns `SubmoduleSnapshot { path, name, base, tree }`;
+  `set_submodule_gitlinks()` writes the new gitlinks into the tree state.
+  `git_submodule::snapshot_submodules()` (lib, async, no `block_on` any more)
+  decides amend-or-child, writes the commit and the submodule operation with
+  `Transaction::write()`, and returns the unpublished operations; the CLI
+  publishes them after the superproject operation is committed.
+- No behaviour change (no snapshot output changed) except the ordering: new
+  check in `test_git_submodule_snapshot` that `--no-integrate-operation`
+  leaves the submodule repo's op heads untouched.
+- Trap: the working copy and the orchestrator each load the submodule repo,
+  so they hold different `Store` instances; `CommitBuilder::set_tree` asserts
+  the tree's store is the repo's. The tree is rebuilt from its ids in the
+  repo's store.
+- Machine note: a test build was OOM-killed (exit 137) while another
+  project's `cargo test` was running; `-j2` got through.
+- Fork: dependabot merged two more commits into `fork/main` on GitHub (nix,
+  npm). Rebased onto them again.

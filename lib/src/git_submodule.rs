@@ -31,6 +31,7 @@ use thiserror::Error;
 use crate::backend::BackendError;
 use crate::backend::CommitId;
 use crate::backend::TreeValue;
+use crate::commit::Commit;
 use crate::config::ConfigGetError;
 use crate::file_util::IoResultExt as _;
 use crate::file_util::PathError;
@@ -55,6 +56,7 @@ use crate::object_id::ObjectId as _;
 use crate::op_store::OpStoreResult;
 use crate::op_walk;
 use crate::ref_name::RemoteName;
+use crate::ref_name::WorkspaceName;
 use crate::repo::BackendInitializer;
 use crate::repo::ReadonlyRepo;
 use crate::repo::Repo as _;
@@ -70,6 +72,9 @@ use crate::str_util::StringExpression;
 use crate::submodule_store::SubmoduleStore;
 use crate::submodule_store::SubmoduleStoreError;
 use crate::transaction::TransactionCommitError;
+use crate::transaction::UnpublishedOperation;
+use crate::working_copy::LockedWorkingCopy;
+use crate::working_copy::SnapshotError;
 
 /// Remote name used inside every submodule repo.
 pub const SUBMODULE_REMOTE: &RemoteName = RemoteName::new("origin");
@@ -355,6 +360,103 @@ pub async fn fetch_submodule(
         .cloned()
         .collect();
     Ok((stats, still_missing))
+}
+
+/// Submodule operations written by [`snapshot_submodules()`], to be published
+/// once the superproject operation that refers to their commits is.
+#[must_use]
+pub struct SubmoduleSnapshotOperations(Vec<UnpublishedOperation>);
+
+impl SubmoduleSnapshotOperations {
+    pub async fn publish(self) -> Result<(), TransactionCommitError> {
+        for operation in self.0 {
+            operation.publish().await?;
+        }
+        Ok(())
+    }
+}
+
+/// Snapshots populated submodules with local changes: commits each one's
+/// directory in its own repo and moves the gitlink in the working-copy tree
+/// to the new commit. Returns the new working-copy tree, or `None` if no
+/// gitlink moved.
+///
+/// A submodule commit is rewritten in place only if an earlier snapshot
+/// created it (the submodule repo records it as the working-copy commit of
+/// the superproject's workspace) and no parent of `wc_commit` refers to it;
+/// otherwise the new commit becomes its child.
+///
+/// The submodule operations are written but not published, so that a
+/// superproject snapshot that doesn't complete leaves nothing behind in the
+/// submodule repos but unreferenced commits.
+pub async fn snapshot_submodules(
+    locked_wc: &mut dyn LockedWorkingCopy,
+    store: &dyn SubmoduleStore,
+    workspace_name: &WorkspaceName,
+    wc_commit: &Commit,
+) -> Result<Option<(MergedTree, SubmoduleSnapshotOperations)>, SnapshotError> {
+    let snapshots = locked_wc.snapshot_submodules().await?;
+    if snapshots.is_empty() {
+        return Ok(None);
+    }
+    let mut gitlinks = vec![];
+    let mut operations = vec![];
+    for snapshot in snapshots {
+        let error = |err: Box<dyn std::error::Error + Send + Sync>| SnapshotError::Other {
+            message: format!(
+                "Failed to snapshot submodule at {}",
+                snapshot.path.as_internal_file_string()
+            ),
+            err,
+        };
+        let Some(loader) = store
+            .load_repo(&snapshot.name)
+            .map_err(|err| error(err.into()))?
+        else {
+            continue;
+        };
+        let repo = loader
+            .load_at_head()
+            .await
+            .map_err(|err| error(err.into()))?;
+        let base = repo.store().get_commit(&snapshot.base)?;
+        // The working copy wrote the tree through its own instance of the
+        // submodule's store.
+        let (tree_ids, labels) = snapshot.tree.into_tree_ids_and_labels();
+        let tree = MergedTree::new(repo.store().clone(), tree_ids, labels);
+        let mut amend = repo.view().get_wc_commit_id(workspace_name) == Some(&snapshot.base);
+        if amend {
+            // A superproject parent refers to the commit: it is history now.
+            let old_value = Some(TreeValue::GitSubmodule(snapshot.base.clone()));
+            for parent in wc_commit.parents().await? {
+                let value = parent.tree().path_value(&snapshot.path).await?;
+                amend &= !value.iter().any(|term| *term == old_value);
+            }
+        }
+        let mut tx = repo.start_transaction();
+        let builder = if amend {
+            tx.repo_mut().rewrite_commit(&base)
+        } else {
+            let parents = vec![snapshot.base.clone()];
+            tx.repo_mut().new_commit(parents, tree.clone())
+        };
+        let commit = builder.set_tree(tree).write().await?;
+        tx.repo_mut()
+            .set_wc_commit(workspace_name.to_owned(), commit.id().clone())
+            .map_err(|err| error(err.into()))?;
+        tx.repo_mut().rebase_descendants().await?;
+        let operation = tx
+            .write("snapshot submodule working copy")
+            .await
+            .map_err(|err| error(err.into()))?;
+        operations.push(operation);
+        gitlinks.push((snapshot.path, commit.id().clone()));
+    }
+    if gitlinks.is_empty() {
+        return Ok(None);
+    }
+    let tree = locked_wc.set_submodule_gitlinks(&gitlinks).await?;
+    Ok(Some((tree, SubmoduleSnapshotOperations(operations))))
 }
 
 /// The subset of `ids` that transactions on `repo`, a submodule repo, wrote

@@ -2165,16 +2165,24 @@ to the current parents may contain changes from multiple commits.
                 .await
                 .map_err(snapshot_command_error)?
         };
-        let new_tree = if snapshot_submodules {
-            locked_ws
-                .locked_wc()
-                .snapshot_submodules(&wc_commit)
-                .await
-                .map_err(snapshot_command_error)?
-                .unwrap_or(new_tree)
-        } else {
-            new_tree
-        };
+        // The submodule commits are written here; their operations are
+        // published after the superproject's, which refers to them.
+        #[cfg(feature = "git")]
+        let (new_tree, submodule_operations) = match snapshot_submodules {
+            true => jj_lib::git_submodule::snapshot_submodules(
+                locked_ws.locked_wc(),
+                self.user_repo.repo.submodule_store().as_ref(),
+                &workspace_name,
+                &wc_commit,
+            )
+            .await
+            .map_err(snapshot_command_error)?
+            .map(|(tree, operations)| (tree, Some(operations))),
+            false => None,
+        }
+        .unwrap_or((new_tree, None));
+        #[cfg(not(feature = "git"))]
+        let _ = snapshot_submodules;
         if new_tree.tree_ids_and_labels() != wc_commit.tree().tree_ids_and_labels() {
             let mut tx = start_repo_transaction(
                 &self.user_repo.repo,
@@ -2316,6 +2324,10 @@ to the current parents may contain changes from multiple commits.
         }
 
         if self.env.command.should_commit_transaction() {
+            #[cfg(feature = "git")]
+            if let Some(operations) = submodule_operations {
+                operations.publish().await.map_err(snapshot_command_error)?;
+            }
             locked_ws
                 .finish(self.user_repo.repo.op_id().clone())
                 .await

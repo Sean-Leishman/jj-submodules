@@ -213,8 +213,12 @@ Implemented (experimental, `git.snapshot-submodules`):
 - A submodule is only snapshotted if its directory was populated from the
   commit the gitlink points at. If the gitlink moved while the directory
   couldn't follow, the changes stay unsnapshotted and protected as before.
-- Submodule tree states are saved together with the superproject's, so a
-  snapshot whose superproject operation doesn't complete is redone.
+- The working copy only produces the submodule trees;
+  `git_submodule::snapshot_submodules()` writes the commits and the
+  submodule operations, which are published only after the superproject's
+  operation. Submodule tree states are likewise saved together with the
+  superproject's. A snapshot whose superproject operation doesn't complete
+  therefore leaves the submodule repos as they were and is simply redone.
 - `jj git submodule delete` refuses (without `--force`) to delete a repo with
   commits that are on none of its remotes.
 - Not done yet: the user's global ignores, auto-track patterns and

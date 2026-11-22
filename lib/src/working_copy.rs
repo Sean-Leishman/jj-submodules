@@ -27,6 +27,7 @@ use thiserror::Error;
 use tracing::instrument;
 
 use crate::backend::BackendError;
+use crate::backend::CommitId;
 use crate::commit::Commit;
 use crate::gitignore::GitIgnoreError;
 use crate::gitignore::GitIgnoreFile;
@@ -139,16 +140,24 @@ pub trait LockedWorkingCopy: Any + Send {
         Ok(vec![])
     }
 
-    /// Commits the local changes of populated Git submodules in their own
-    /// repos and moves the gitlinks in the working-copy tree to the new
-    /// commits. A submodule commit is rewritten in place only if an earlier
-    /// call created it and no parent of `wc_commit` refers to it. Returns the
-    /// new working-copy tree, or `None` if no gitlink moved.
-    async fn snapshot_submodules(
+    /// Snapshots the directories of populated Git submodules into their own
+    /// stores and returns those whose contents changed. Nothing is committed:
+    /// the caller writes a submodule commit for each tree and passes the
+    /// commits to [`Self::set_submodule_gitlinks()`].
+    async fn snapshot_submodules(&mut self) -> Result<Vec<SubmoduleSnapshot>, SnapshotError> {
+        Ok(vec![])
+    }
+
+    /// Points the gitlinks at the given paths of the working-copy tree at the
+    /// given submodule commits, and returns the new tree.
+    async fn set_submodule_gitlinks(
         &mut self,
-        _wc_commit: &Commit,
-    ) -> Result<Option<MergedTree>, SnapshotError> {
-        Ok(None)
+        _gitlinks: &[(RepoPathBuf, CommitId)],
+    ) -> Result<MergedTree, SnapshotError> {
+        Err(SnapshotError::Other {
+            message: "This working copy doesn't support Git submodules".to_owned(),
+            err: "not supported".into(),
+        })
     }
 
     /// Removes the populated contents of the Git submodule at `path`.
@@ -198,6 +207,21 @@ impl dyn LockedWorkingCopy {
     pub fn downcast_mut<T: LockedWorkingCopy>(&mut self) -> Option<&mut T> {
         (self as &mut dyn Any).downcast_mut()
     }
+}
+
+/// New contents of a populated Git submodule's directory, see
+/// [`LockedWorkingCopy::snapshot_submodules()`].
+#[derive(Clone, Debug)]
+pub struct SubmoduleSnapshot {
+    /// Path of the submodule in the working copy.
+    pub path: RepoPathBuf,
+    /// Name of the submodule in `.gitmodules`.
+    pub name: String,
+    /// The submodule commit the directory was populated from, which is what
+    /// the working-copy tree's gitlink points at.
+    pub base: CommitId,
+    /// The directory's contents now, in the submodule repo's store.
+    pub tree: MergedTree,
 }
 
 /// An error while snapshotting the working copy.

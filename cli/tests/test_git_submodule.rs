@@ -1865,7 +1865,26 @@ fn test_git_submodule_snapshot() {
     let added = b"\x00bin\r\n\xff";
     std::fs::write(sub_dir.join("sub"), "edited\n").unwrap();
     std::fs::write(sub_dir.join("added"), added).unwrap();
+    // A superproject snapshot that isn't integrated leaves the submodule repo
+    // as it was: its operation is only published after the superproject's.
+    let sub_op_heads = || {
+        let heads = work_dir
+            .root()
+            .join(".jj/repo/submodule_store/sub/op_heads/heads");
+        let mut names: Vec<_> = std::fs::read_dir(heads)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        names.sort();
+        names
+    };
+    let heads_before = sub_op_heads();
+    work_dir
+        .run_jj(["status", "--no-integrate-operation"])
+        .success();
+    assert_eq!(sub_op_heads(), heads_before);
     let output = work_dir.run_jj(["status"]);
+    assert_ne!(sub_op_heads(), heads_before);
     insta::assert_snapshot!(output, @"
     Working copy changes:
     M sub
@@ -1919,8 +1938,8 @@ fn test_git_submodule_snapshot() {
     let output = work_dir.run_jj(["undo"]).normalize_stderr_with(hide_ids);
     insta::assert_snapshot!(output, @"
     ------- stderr -------
-    Undid operation: [id] (2001-02-03 08:05:32) new empty commit
-    Restored to operation: [id] (2001-02-03 08:05:28) snapshot working copy
+    Undid operation: [id] (2001-02-03 08:05:33) new empty commit
+    Restored to operation: [id] (2001-02-03 08:05:29) snapshot working copy
     Working copy  (@) now at: 
     Parent commit (@-)      : edit sub
     Added 1 files, modified 2 files, removed 0 files
