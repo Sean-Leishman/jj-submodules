@@ -282,10 +282,12 @@ repo has hidden, and a rewrite only carries visible descendants along.
   top, and the later superproject commits are substituted. That is how a
   conflict in, or the description of, an earlier local submodule commit is
   fixed.
-- Open: a submodule commit that an *immutable* superproject commit refers to
-  should count as immutable too. Scanning all history for gitlinks is too
-  slow; treating ancestors of the gitlinks of `immutable_heads()` as
-  immutable covers a submodule whose pointer only moves forward.
+- A submodule commit that an immutable superproject commit depends on is not
+  rewritten either (snapshots create a child instead; `rebase` and
+  `describe` refuse). Scanning all history for gitlinks is too slow, so the
+  test is: the commit is, or is an ancestor of, a gitlink in one of the heads
+  of the immutable set. That covers a submodule pointer that only moves
+  forward along immutable history, not one that moved sideways.
 - Not covered: merging diverging gitlinks during a superproject rebase or
   merge (it stays a gitlink conflict, resolved with `jj git submodule set`).
   Doing that automatically means teaching the tree merge about submodules,

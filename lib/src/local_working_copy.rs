@@ -3391,7 +3391,7 @@ impl LockedLocalWorkingCopy {
 }
 
 /// Snapshotting submodule directories. The working copy only produces the
-/// trees; `git_submodule::snapshot_submodules()` commits them in the
+/// trees; `git_submodule::commit_submodule_snapshots()` commits them in the
 /// submodule repos and hands the commits back for the gitlinks.
 #[cfg(feature = "git")]
 impl LockedLocalWorkingCopy {

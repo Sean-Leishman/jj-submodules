@@ -1248,6 +1248,40 @@ impl WorkspaceCommandEnvironment {
         .map_err(|e| config_error_with_message("Invalid `revset-aliases.immutable_heads()`", e))
     }
 
+    /// The submodule commits that the gitlinks at `path` in the heads of the
+    /// immutable set point at. Rewriting those or their ancestors would leave
+    /// immutable commits pointing at commits that are going away.
+    // ponytail: ancestors of immutable heads may point at submodule commits
+    // that aren't ancestors of these (a submodule pointer that moved
+    // sideways); those aren't covered. Index gitlinks if that matters.
+    pub async fn immutable_gitlinks(
+        &self,
+        repo: &dyn Repo,
+        path: &RepoPath,
+    ) -> Result<Vec<CommitId>, CommandError> {
+        if self.command.global_args().ignore_immutable {
+            return Ok(vec![]);
+        }
+        let id_prefix_context = IdPrefixContext::new(self.command.revset_extensions().clone());
+        let mut commits = RevsetExpressionEvaluator::new(
+            repo,
+            self.command.revset_extensions().clone(),
+            &id_prefix_context,
+            self.immutable_heads_expression().heads(),
+        )
+        .evaluate_to_commits()
+        .map_err(|e| config_error_with_message("Invalid `revset-aliases.immutable_heads()`", e))?;
+        let mut gitlinks = vec![];
+        while let Some(commit) = commits.try_next().await? {
+            for term in commit.tree().path_value(path).await?.iter() {
+                if let Some(TreeValue::GitSubmodule(id)) = term {
+                    gitlinks.push(id.clone());
+                }
+            }
+        }
+        Ok(gitlinks)
+    }
+
     pub fn template_aliases_map(&self) -> &TemplateAliasesMap {
         &self.template_aliases_map
     }
@@ -2168,19 +2202,41 @@ to the current parents may contain changes from multiple commits.
         // The submodule commits are written here; their operations are
         // published after the superproject's, which refers to them.
         #[cfg(feature = "git")]
-        let (new_tree, submodule_operations) = match snapshot_submodules {
-            true => jj_lib::git_submodule::snapshot_submodules(
-                locked_ws.locked_wc(),
-                self.user_repo.repo.submodule_store().as_ref(),
-                &workspace_name,
-                &wc_commit,
-            )
-            .await
-            .map_err(snapshot_command_error)?
-            .map(|(tree, operations)| (tree, Some(operations))),
-            false => None,
-        }
-        .unwrap_or((new_tree, None));
+        let (new_tree, submodule_operations) = {
+            let snapshots = match snapshot_submodules {
+                true => locked_ws
+                    .locked_wc()
+                    .snapshot_submodules()
+                    .await
+                    .map_err(snapshot_command_error)?,
+                false => vec![],
+            };
+            if snapshots.is_empty() {
+                (new_tree, None)
+            } else {
+                let repo = &self.user_repo.repo;
+                let mut protected = HashMap::new();
+                for snapshot in &snapshots {
+                    let gitlinks = self
+                        .env
+                        .immutable_gitlinks(repo.as_ref(), &snapshot.path)
+                        .await
+                        .map_err(snapshot_command_error)?;
+                    protected.insert(snapshot.path.clone(), gitlinks);
+                }
+                let (tree, operations) = jj_lib::git_submodule::commit_submodule_snapshots(
+                    locked_ws.locked_wc(),
+                    repo.submodule_store().as_ref(),
+                    &workspace_name,
+                    &wc_commit,
+                    snapshots,
+                    &protected,
+                )
+                .await
+                .map_err(snapshot_command_error)?;
+                (tree, Some(operations))
+            }
+        };
         #[cfg(not(feature = "git"))]
         let _ = snapshot_submodules;
         if new_tree.tree_ids_and_labels() != wc_commit.tree().tree_ids_and_labels() {

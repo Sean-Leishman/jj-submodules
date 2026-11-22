@@ -787,7 +787,7 @@ async fn cmd_submodule_rebase(
         writeln!(ui.status(), "Nothing changed.")?;
         return Ok(());
     };
-    check_locally_written(&sub_repo, name, &rewrites).await?;
+    check_submodule_rewrites(&workspace_command, &sub_repo, &config, &rewrites).await?;
     // ponytail: only the tip is checked out, so only its conflicts can be
     // resolved. Lifting this needs snapshots made while an earlier
     // superproject commit is edited to rewrite its submodule commit.
@@ -875,7 +875,7 @@ async fn cmd_submodule_describe(
             },
         )
         .await?;
-    check_locally_written(&sub_repo, name, &rewrites).await?;
+    check_submodule_rewrites(&workspace_command, &sub_repo, &config, &rewrites).await?;
     tx.commit(format!("describe commit {}", old_id.hex()))
         .await?;
     let description = format!("describe commit {} of submodule {name}", old_id.hex());
@@ -1057,17 +1057,30 @@ async fn working_copy_gitlink(
 }
 
 /// Refuses to replace submodule commits that were fetched rather than made
-/// here. Called with what a submodule transaction rewrote, before it is
-/// committed.
-async fn check_locally_written(
+/// here, or that immutable superproject commits depend on. Called with what
+/// a submodule transaction rewrote, before it is committed.
+async fn check_submodule_rewrites(
+    workspace_command: &WorkspaceCommandHelper,
     sub_repo: &ReadonlyRepo,
-    name: &str,
+    config: &SubmoduleConfig,
     rewrites: &HashMap<CommitId, CommitId>,
 ) -> Result<(), CommandError> {
+    let name = &config.name;
     let local = git_submodule::locally_written(sub_repo, rewrites.keys().cloned()).await?;
-    if let Some(id) = rewrites.keys().find(|id| !local.contains(id)) {
+    let protected = workspace_command
+        .env()
+        .immutable_gitlinks(workspace_command.repo().as_ref(), &config.path)
+        .await?;
+    for id in rewrites.keys() {
+        let reason = if !local.contains(id) {
+            "it was not made here"
+        } else if git_submodule::is_protected(sub_repo, id, &protected).await? {
+            "an immutable commit refers to it or to a descendant"
+        } else {
+            continue;
+        };
         return Err(user_error(format!(
-            "Won't rewrite commit {} of submodule {name:?} since it was not made here",
+            "Won't rewrite commit {} of submodule {name:?} since {reason}",
             short_commit_hash(id)
         ))
         .hinted(format!(

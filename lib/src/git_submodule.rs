@@ -51,6 +51,7 @@ use crate::git::add_remote;
 use crate::git::get_git_backend;
 use crate::git_backend::GitBackend;
 use crate::git_subprocess::GitSubprocessContext;
+use crate::index::IndexResult;
 use crate::merged_tree::MergedTree;
 use crate::object_id::ObjectId as _;
 use crate::op_store::OpStoreResult;
@@ -75,6 +76,7 @@ use crate::transaction::TransactionCommitError;
 use crate::transaction::UnpublishedOperation;
 use crate::working_copy::LockedWorkingCopy;
 use crate::working_copy::SnapshotError;
+use crate::working_copy::SubmoduleSnapshot;
 
 /// Remote name used inside every submodule repo.
 pub const SUBMODULE_REMOTE: &RemoteName = RemoteName::new("origin");
@@ -362,7 +364,7 @@ pub async fn fetch_submodule(
     Ok((stats, still_missing))
 }
 
-/// Submodule operations written by [`snapshot_submodules()`], to be published
+/// Submodule operations written by [`commit_submodule_snapshots()`], to be published
 /// once the superproject operation that refers to their commits is.
 #[must_use]
 pub struct SubmoduleSnapshotOperations(Vec<UnpublishedOperation>);
@@ -376,10 +378,9 @@ impl SubmoduleSnapshotOperations {
     }
 }
 
-/// Snapshots populated submodules with local changes: commits each one's
-/// directory in its own repo and moves the gitlink in the working-copy tree
-/// to the new commit. Returns the new working-copy tree, or `None` if no
-/// gitlink moved.
+/// Commits the new contents of submodule directories in the submodules' own
+/// repos and moves the gitlinks in the working-copy tree to the new commits.
+/// Returns the new working-copy tree.
 ///
 /// A submodule commit is rewritten in place only if an earlier snapshot
 /// created it (the submodule repo records it as the working-copy commit of
@@ -389,16 +390,18 @@ impl SubmoduleSnapshotOperations {
 /// The submodule operations are written but not published, so that a
 /// superproject snapshot that doesn't complete leaves nothing behind in the
 /// submodule repos but unreferenced commits.
-pub async fn snapshot_submodules(
+///
+/// `snapshots` come from [`LockedWorkingCopy::snapshot_submodules()`];
+/// `protected` has, by submodule path, the submodule commits that superproject
+/// commits which must not change refer to (see [`is_protected()`]).
+pub async fn commit_submodule_snapshots(
     locked_wc: &mut dyn LockedWorkingCopy,
     store: &dyn SubmoduleStore,
     workspace_name: &WorkspaceName,
     wc_commit: &Commit,
-) -> Result<Option<(MergedTree, SubmoduleSnapshotOperations)>, SnapshotError> {
-    let snapshots = locked_wc.snapshot_submodules().await?;
-    if snapshots.is_empty() {
-        return Ok(None);
-    }
+    snapshots: Vec<SubmoduleSnapshot>,
+    protected: &HashMap<RepoPathBuf, Vec<CommitId>>,
+) -> Result<(MergedTree, SubmoduleSnapshotOperations), SnapshotError> {
     let mut gitlinks = vec![];
     let mut operations = vec![];
     for snapshot in snapshots {
@@ -433,6 +436,11 @@ pub async fn snapshot_submodules(
                 amend &= !value.iter().any(|term| *term == old_value);
             }
         }
+        if amend && let Some(protected) = protected.get(&snapshot.path) {
+            amend = !is_protected(&repo, &snapshot.base, protected)
+                .await
+                .map_err(|err| error(err.into()))?;
+        }
         let mut tx = repo.start_transaction();
         let builder = if amend {
             tx.repo_mut().rewrite_commit(&base)
@@ -452,11 +460,31 @@ pub async fn snapshot_submodules(
         operations.push(operation);
         gitlinks.push((snapshot.path, commit.id().clone()));
     }
-    if gitlinks.is_empty() {
-        return Ok(None);
-    }
     let tree = locked_wc.set_submodule_gitlinks(&gitlinks).await?;
-    Ok(Some((tree, SubmoduleSnapshotOperations(operations))))
+    Ok((tree, SubmoduleSnapshotOperations(operations)))
+}
+
+/// Whether submodule commit `id` must not be rewritten because a superproject
+/// commit that must not change depends on it: `heads` are the submodule
+/// commits such superproject commits point at, and their ancestors are
+/// assumed to be referred to by those commits' own ancestors.
+pub async fn is_protected(
+    repo: &ReadonlyRepo,
+    id: &CommitId,
+    heads: &[CommitId],
+) -> IndexResult<bool> {
+    let index = repo.index();
+    for head in heads {
+        // Commits fetched by hash are in the store but not in the index.
+        if head == id
+            || (index.has_id(head).await?
+                && index.has_id(id).await?
+                && index.is_ancestor(id, head).await?)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// The subset of `ids` that transactions on `repo`, a submodule repo, wrote

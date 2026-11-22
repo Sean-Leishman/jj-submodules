@@ -694,3 +694,21 @@ Revised split (one commit each, tests in each, docs as they land):
   project's `cargo test` was running; `-j2` got through.
 - Fork: dependabot merged two more commits into `fork/main` on GitHub (nix,
   npm). Rebased onto them again.
+
+### 2026-11-22 — follow-rewrites step D: immutable references
+
+- `WorkspaceCommandEnvironment::immutable_gitlinks(repo, path)`: gitlinks at
+  the submodule path in `heads(immutable_heads())`; `git_submodule::
+  is_protected()`: the commit is one of those or an ancestor (index query).
+  Used by the snapshot's amend decision (protected → child) and, via
+  `check_submodule_rewrites()`, by `rebase`/`describe` (refuse). Skipped
+  under `--ignore-immutable`.
+- The snapshot entry point is now two calls so the CLI computes the
+  protected set only when a submodule actually changed:
+  `locked_wc.snapshot_submodules()` then
+  `git_submodule::commit_submodule_snapshots(.., snapshots, &protected)`.
+- Test gotcha: `jj tag set v1 -r @` makes `@` immutable and jj moves the
+  working copy to a new child, so `jj new @-` afterwards is a child of the
+  tagged commit, not a sibling. Use `jj new v1-`.
+- Heuristic limit (in the code as a ponytail note): a submodule pointer that
+  moved sideways in immutable history isn't covered.

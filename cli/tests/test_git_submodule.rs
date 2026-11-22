@@ -2523,3 +2523,40 @@ fn test_git_submodule_follow_rewrites() {
     let output = work_dir.run_jj(["log", "-r", "all() & conflicts()"]);
     insta::assert_snapshot!(output, @"");
 }
+
+/// Submodule commits that an immutable superproject commit depends on are not
+/// rewritten, even though they were made here.
+#[test]
+fn test_git_submodule_immutable_references() {
+    let test_env = TestEnvironment::default();
+    let work_dir = set_up_superproject(&test_env);
+    let sub_dir = work_dir.root().join("sub");
+    let parent_of = |id: &str| submodule_git(&work_dir, &["rev-parse", &format!("{id}^")]);
+    work_dir
+        .run_jj(["git", "submodule", "clone", "sub"])
+        .success();
+    std::fs::write(sub_dir.join("sub"), "released\n").unwrap();
+    let released = gitlink(&work_dir);
+    work_dir.run_jj(["tag", "set", "v1", "-r", "@"]).success();
+
+    // Another superproject commit points at the same submodule commit, which
+    // is still the one the submodule repo would rewrite.
+    work_dir.run_jj(["new", "v1-"]).success();
+    work_dir
+        .run_jj(["git", "submodule", "set", "sub", &released])
+        .success();
+    let output = work_dir
+        .run_jj(["git", "submodule", "describe", "sub", "-m", "Released"])
+        .normalize_stderr_with(hide_ids);
+    insta::assert_snapshot!(output, @r#"
+    ------- stderr -------
+    Error: Won't rewrite commit [id] of submodule "sub" since an immutable commit refers to it or to a descendant
+    Hint: `jj git submodule set sub` can point the gitlink at another commit.
+    [EOF]
+    [exit status: 1]
+    "#);
+    // A snapshot puts the change in a new commit on top instead.
+    std::fs::write(sub_dir.join("sub"), "after release\n").unwrap();
+    assert_eq!(parent_of(&gitlink(&work_dir)), released);
+    assert_eq!(gitlink_at(&work_dir, "v1"), released);
+}
