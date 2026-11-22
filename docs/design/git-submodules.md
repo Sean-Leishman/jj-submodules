@@ -204,12 +204,21 @@ Implemented (experimental, `git.snapshot-submodules`):
   records the new gitlink. This needs nothing new from the operation log or
   the backend: the two repos' operations are not tied together, and undoing
   in the superproject just checks out the older gitlink.
-- The submodule repo records the commit as the working-copy commit of the
-  superproject's workspace (in its own view). The next snapshot rewrites it
-  in place if the gitlink still points at it and no parent of the
-  superproject's working-copy commit refers to it; otherwise it creates a
-  child. Upstream commits and commits the superproject's history refers to
-  are therefore never rewritten.
+- The commit the gitlink points at is rewritten in place if it was made
+  here (a transaction on the submodule repo wrote it, per its operation log),
+  no parent of the superproject's working-copy commit refers to it, and no
+  immutable superproject commit depends on it; otherwise the new commit
+  becomes its child. Upstream commits and commits the superproject's history
+  refers to are therefore never rewritten. The submodule repo also records
+  the commit as the working-copy commit of the superproject's workspace, for
+  display in `jj git submodule log` only.
+- The later superproject commits (descendants of the working-copy commit)
+  follow: the local submodule commits they have on top of the old one are
+  rebased onto the new one in the submodule repo, and their gitlinks are
+  replaced. So with an earlier superproject commit checked out (`jj edit`),
+  the submodule's files are that commit's, and editing them changes its
+  submodule commit, or gives it one if it had none of its own, with
+  everything later carried along.
 - A submodule is only snapshotted if its directory was populated from the
   commit the gitlink points at. If the gitlink moved while the directory
   couldn't follow, the changes stay unsnapshotted and protected as before.
@@ -242,13 +251,11 @@ materialized in the submodule's files and resolved by editing them (the next
 snapshot rewrites the commit); `jj status` reports the submodule as having
 conflicts.
 
-Every mutable superproject commit follows the rewrite (see below), for
-`rebase` and `describe`. A rebase that would leave a conflict in an earlier
-submodule commit is still refused: snapshots can't yet rewrite the submodule
-commit of an earlier superproject commit that is being edited, so the
-conflict couldn't be resolved.
+Every mutable superproject commit follows the rewrite (see below). If the
+rebase leaves a conflict in an earlier submodule commit, it is resolved with
+the superproject commit that points at it checked out.
 
-#### Superproject commits follow submodule rewrites (in progress)
+#### Superproject commits follow submodule rewrites
 
 Whenever a transaction on a submodule repo rewrites commits (rebase,
 describe, a snapshot that amends a commit with descendants), it yields a map
@@ -257,12 +264,14 @@ every *mutable* superproject commit whose tree has a gitlink at the
 submodule's path pointing at an old id gets that gitlink replaced by the new
 id.
 
-Done for `rebase` and `describe`; the items about snapshots below are not
-implemented yet. The superproject, not the submodule repo, decides which
-submodule commits matter: before rewriting, the commits that mutable
-superproject commits point at are made visible in the submodule repo, since
-an undone rewrite leaves the superproject pointing at commits the submodule
-repo has hidden, and a rewrite only carries visible descendants along.
+`rebase` and `describe` substitute in all mutable commits; a snapshot only in
+the descendants of the working-copy commit (other commits that point at the
+old submodule commit keep it). The superproject, not the submodule repo,
+decides which submodule commits matter: before rewriting, the commits that
+the superproject commits in question point at are made visible in the
+submodule repo, since an undone rewrite leaves the superproject pointing at
+commits the submodule repo has hidden, and a rewrite only carries visible
+descendants along.
 
 - This is a substitution, not a rebase. The generic rebase of a descendant
   merges trees, and a three-way merge of gitlinks whose base and both sides
@@ -273,15 +282,8 @@ repo has hidden, and a rewrite only carries visible descendants along.
   replaced.
 - Immutable superproject commits are left alone; the old submodule commits
   stay in the submodule's store for them and for the operation log.
-- With that in place, the rule for what a snapshot may rewrite no longer
-  needs the working-copy pointer: a submodule commit is rewritten in place
-  unless it wasn't made here or a parent of the working-copy commit has that
-  gitlink. `jj edit <earlier commit>` then lets the
-  submodule's files of that commit be edited: the snapshot rewrites its
-  submodule commit, the submodule repo rebases the later local commits on
-  top, and the later superproject commits are substituted. That is how a
-  conflict in, or the description of, an earlier local submodule commit is
-  fixed.
+- For snapshots the descendants are rebased normally, and then get their
+  own gitlink back, mapped through the rewrites, at the submodule's path.
 - A submodule commit that an immutable superproject commit depends on is not
   rewritten either (snapshots create a child instead; `rebase` and
   `describe` refuse). Scanning all history for gitlinks is too slow, so the
@@ -309,7 +311,6 @@ tracked local bookmark, which is what "pushed from here" means afterwards:
 Commits with conflicts are refused, and so are commits without a description
 unless `--allow-empty-description` is given. Snapshot commits start without
 one; `jj git submodule describe <name> -m <message>` sets it on the commit the
-working-copy commit's gitlink points at (later snapshots keep it), under the
-same rule as snapshots: not if the commit wasn't made here or a parent of the
-working-copy commit refers to it. So a submodule commit is
-described before the superproject change that contains it is committed.
+working-copy commit's gitlink points at (later snapshots keep it), in every
+mutable commit that points at it; an earlier one is described with its
+superproject commit checked out.

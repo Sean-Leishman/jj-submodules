@@ -29,6 +29,7 @@ use futures::TryStreamExt as _;
 use thiserror::Error;
 
 use crate::backend::BackendError;
+use crate::backend::BackendResult;
 use crate::backend::CommitId;
 use crate::backend::TreeValue;
 use crate::commit::Commit;
@@ -53,18 +54,28 @@ use crate::git_backend::GitBackend;
 use crate::git_subprocess::GitSubprocessContext;
 use crate::index::IndexResult;
 use crate::merged_tree::MergedTree;
+use crate::merged_tree_builder::MergedTreeBuilder;
 use crate::object_id::ObjectId as _;
 use crate::op_store::OpStoreResult;
 use crate::op_walk;
 use crate::ref_name::RemoteName;
 use crate::ref_name::WorkspaceName;
 use crate::repo::BackendInitializer;
+use crate::repo::MutableRepo;
 use crate::repo::ReadonlyRepo;
-use crate::repo::Repo as _;
+use crate::repo::Repo;
 use crate::repo::RepoInitError;
 use crate::repo::RepoLoaderError;
 use crate::repo_path::RepoPath;
 use crate::repo_path::RepoPathBuf;
+use crate::revset::ResolvedRevsetExpression;
+use crate::revset::RevsetExpression;
+use crate::revset::RevsetStreamExt as _;
+use crate::rewrite::MoveCommitsLocation;
+use crate::rewrite::MoveCommitsTarget;
+use crate::rewrite::RebaseOptions;
+use crate::rewrite::RebasedCommit;
+use crate::rewrite::move_commits;
 use crate::settings::UserSettings;
 use crate::signing_factory::SignInitError;
 use crate::signing_factory::signer_from_settings;
@@ -378,14 +389,27 @@ impl SubmoduleSnapshotOperations {
     }
 }
 
+/// What [`commit_submodule_snapshots()`] did.
+pub struct SubmoduleSnapshotOutcome {
+    /// The working-copy tree with the gitlinks moved.
+    pub tree: MergedTree,
+    /// To be published once the superproject operation is.
+    pub operations: SubmoduleSnapshotOperations,
+    /// By submodule path, the submodule commits that were replaced and what
+    /// replaced them, for [`rebase_descendants_following_submodules()`].
+    pub rewrites: HashMap<RepoPathBuf, HashMap<CommitId, CommitId>>,
+}
+
 /// Commits the new contents of submodule directories in the submodules' own
 /// repos and moves the gitlinks in the working-copy tree to the new commits.
-/// Returns the new working-copy tree.
 ///
-/// A submodule commit is rewritten in place only if an earlier snapshot
-/// created it (the submodule repo records it as the working-copy commit of
-/// the superproject's workspace) and no parent of `wc_commit` refers to it;
-/// otherwise the new commit becomes its child.
+/// The commit a gitlink points at is rewritten in place if it was made here
+/// (see [`locally_written()`]), no parent of `wc_commit` refers to it, and
+/// nothing immutable depends on it; otherwise the new commit becomes its
+/// child. Either way, the local submodule commits that descendants of
+/// `wc_commit` in `superproject` have on top of it are rebased onto the new
+/// commit. The superproject, not the submodule repo, says which commits
+/// those are: it may point at commits the submodule repo has hidden.
 ///
 /// The submodule operations are written but not published, so that a
 /// superproject snapshot that doesn't complete leaves nothing behind in the
@@ -398,70 +422,213 @@ pub async fn commit_submodule_snapshots(
     locked_wc: &mut dyn LockedWorkingCopy,
     store: &dyn SubmoduleStore,
     workspace_name: &WorkspaceName,
+    superproject: &dyn Repo,
     wc_commit: &Commit,
     snapshots: Vec<SubmoduleSnapshot>,
     protected: &HashMap<RepoPathBuf, Vec<CommitId>>,
-) -> Result<(MergedTree, SubmoduleSnapshotOperations), SnapshotError> {
+) -> Result<SubmoduleSnapshotOutcome, SnapshotError> {
+    fn other(err: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> SnapshotError {
+        SnapshotError::Other {
+            message: "Failed to snapshot submodules".to_owned(),
+            err: err.into(),
+        }
+    }
+    let wc_id = RevsetExpression::commit(wc_commit.id().clone());
+    let later_commits: Vec<Commit> = wc_id
+        .descendants()
+        .minus(&wc_id)
+        .evaluate(superproject)
+        .map_err(other)?
+        .stream()
+        .commits(superproject.store())
+        .try_collect()
+        .await
+        .map_err(other)?;
+
     let mut gitlinks = vec![];
     let mut operations = vec![];
+    let mut all_rewrites = HashMap::new();
     for snapshot in snapshots {
-        let error = |err: Box<dyn std::error::Error + Send + Sync>| SnapshotError::Other {
-            message: format!(
-                "Failed to snapshot submodule at {}",
-                snapshot.path.as_internal_file_string()
-            ),
-            err,
-        };
-        let Some(loader) = store
-            .load_repo(&snapshot.name)
-            .map_err(|err| error(err.into()))?
-        else {
+        let Some(loader) = store.load_repo(&snapshot.name).map_err(other)? else {
             continue;
         };
-        let repo = loader
-            .load_at_head()
-            .await
-            .map_err(|err| error(err.into()))?;
+        let repo = loader.load_at_head().await.map_err(other)?;
         let base = repo.store().get_commit(&snapshot.base)?;
         // The working copy wrote the tree through its own instance of the
         // submodule's store.
         let (tree_ids, labels) = snapshot.tree.into_tree_ids_and_labels();
         let tree = MergedTree::new(repo.store().clone(), tree_ids, labels);
-        let mut amend = repo.view().get_wc_commit_id(workspace_name) == Some(&snapshot.base);
-        if amend {
-            // A superproject parent refers to the commit: it is history now.
-            let old_value = Some(TreeValue::GitSubmodule(snapshot.base.clone()));
-            for parent in wc_commit.parents().await? {
-                let value = parent.tree().path_value(&snapshot.path).await?;
-                amend &= !value.iter().any(|term| *term == old_value);
+        let base_value = Some(TreeValue::GitSubmodule(snapshot.base.clone()));
+        let mut later_gitlinks = vec![];
+        for commit in &later_commits {
+            let value = commit.tree().path_value(&snapshot.path).await?;
+            if let Some(Some(TreeValue::GitSubmodule(id))) = value.as_resolved()
+                && *id != snapshot.base
+                && repo.index().has_id(id).await.map_err(other)?
+            {
+                later_gitlinks.push(id.clone());
             }
         }
-        if amend && let Some(protected) = protected.get(&snapshot.path) {
-            amend = !is_protected(&repo, &snapshot.base, protected)
+        let no_heads = vec![];
+        let protected = protected.get(&snapshot.path).unwrap_or(&no_heads);
+        // Whether all of these commits are ours to rewrite.
+        let rewritable = async |ids: Vec<CommitId>| -> Result<bool, SnapshotError> {
+            let local = locally_written(&repo, ids.iter().cloned())
                 .await
-                .map_err(|err| error(err.into()))?;
-        }
+                .map_err(other)?;
+            for id in &ids {
+                if !local.contains(id) || is_protected(&repo, id, protected).await.map_err(other)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        };
+
         let mut tx = repo.start_transaction();
-        let builder = if amend {
-            tx.repo_mut().rewrite_commit(&base)
+        let base_indexed = repo.index().has_id(&snapshot.base).await.map_err(other)?;
+        for id in &later_gitlinks {
+            let commit = repo.store().get_commit(id)?;
+            tx.repo_mut().add_head(&commit).await?;
+        }
+        if base_indexed {
+            tx.repo_mut().add_head(&base).await?;
+        }
+        let evaluate = async |repo: &dyn Repo, expression: Arc<ResolvedRevsetExpression>| {
+            let revset = expression.evaluate(repo).map_err(other)?;
+            let ids: Vec<CommitId> = revset.stream().try_collect().await.map_err(other)?;
+            Ok::<_, SnapshotError>(ids)
+        };
+        let base_id = RevsetExpression::commit(snapshot.base.clone());
+
+        let mut amend = base_indexed && rewritable(vec![snapshot.base.clone()]).await?;
+        if amend {
+            // A superproject parent refers to the commit: it is history now.
+            for parent in wc_commit.parents().await? {
+                let value = parent.tree().path_value(&snapshot.path).await?;
+                amend &= !value.iter().any(|term| *term == base_value);
+            }
+        }
+        if amend {
+            // Rewriting it rebases everything on top of it.
+            let on_top = base_id.descendants().minus(&base_id);
+            amend = rewritable(evaluate(tx.repo(), on_top).await?).await?;
+        }
+        let mut rewrites = HashMap::new();
+        let commit = if amend {
+            let commit = tx
+                .repo_mut()
+                .rewrite_commit(&base)
+                .set_tree(tree)
+                .write()
+                .await?;
+            tx.repo_mut()
+                .rebase_descendants_with_options(
+                    &RevsetExpression::none(),
+                    &RebaseOptions::default(),
+                    |old_commit, rebased| {
+                        if let RebasedCommit::Rewritten(new_commit) = rebased {
+                            rewrites.insert(old_commit.id().clone(), new_commit.id().clone());
+                        }
+                    },
+                )
+                .await?;
+            commit
         } else {
             let parents = vec![snapshot.base.clone()];
-            tx.repo_mut().new_commit(parents, tree.clone())
+            let commit = tx.repo_mut().new_commit(parents, tree).write().await?;
+            // What later superproject commits have on top of the base moves
+            // on top of the new commit, if it is all ours.
+            let roots = match base_indexed && !later_gitlinks.is_empty() {
+                true => {
+                    let later = RevsetExpression::commits(later_gitlinks);
+                    evaluate(tx.repo(), base_id.range(&later).roots()).await?
+                }
+                false => vec![],
+            };
+            let moved = RevsetExpression::commits(roots.clone()).descendants();
+            if !roots.is_empty() && rewritable(evaluate(tx.repo(), moved).await?).await? {
+                let stats = move_commits(
+                    tx.repo_mut(),
+                    &MoveCommitsLocation {
+                        new_parent_ids: vec![commit.id().clone()],
+                        new_child_ids: vec![],
+                        target: MoveCommitsTarget::Roots(roots),
+                    },
+                    &RebaseOptions::default(),
+                )
+                .await?;
+                tx.repo_mut().rebase_descendants().await?;
+                for (old_id, rebased) in stats.rebased_commits {
+                    if let RebasedCommit::Rewritten(new_commit) = rebased {
+                        rewrites.insert(old_id, new_commit.id().clone());
+                    }
+                }
+            }
+            commit
         };
-        let commit = builder.set_tree(tree).write().await?;
+        rewrites.insert(snapshot.base.clone(), commit.id().clone());
+        // Shown as the working-copy commit in `jj git submodule log`.
         tx.repo_mut()
             .set_wc_commit(workspace_name.to_owned(), commit.id().clone())
-            .map_err(|err| error(err.into()))?;
+            .map_err(other)?;
         tx.repo_mut().rebase_descendants().await?;
         let operation = tx
             .write("snapshot submodule working copy")
             .await
-            .map_err(|err| error(err.into()))?;
+            .map_err(other)?;
         operations.push(operation);
-        gitlinks.push((snapshot.path, commit.id().clone()));
+        gitlinks.push((snapshot.path.clone(), commit.id().clone()));
+        all_rewrites.insert(snapshot.path, rewrites);
     }
     let tree = locked_wc.set_submodule_gitlinks(&gitlinks).await?;
-    Ok((tree, SubmoduleSnapshotOperations(operations)))
+    Ok(SubmoduleSnapshotOutcome {
+        tree,
+        operations: SubmoduleSnapshotOperations(operations),
+        rewrites: all_rewrites,
+    })
+}
+
+/// Rebases the descendants of `roots`, commits rewritten in this transaction,
+/// like `rebase_descendants()` does, except at the submodule paths in
+/// `rewrites`: there each descendant keeps its own gitlink, mapped through
+/// the rewrites, where a rebase would merge it with its parent's change and
+/// call it a conflict whenever both differ. Returns the number of commits
+/// rebased.
+pub async fn rebase_descendants_following_submodules(
+    mut_repo: &mut MutableRepo,
+    roots: Vec<CommitId>,
+    rewrites: &HashMap<RepoPathBuf, HashMap<CommitId, CommitId>>,
+) -> BackendResult<usize> {
+    let mut num_rebased = 0;
+    mut_repo
+        .transform_descendants(roots, async |rewriter| {
+            if !rewriter.parents_changed() {
+                return Ok(());
+            }
+            let old_tree = rewriter.old_commit().tree();
+            let builder = rewriter.rebase().await?;
+            let mut tree_builder = MergedTreeBuilder::new(builder.tree());
+            for (path, rewrites) in rewrites {
+                // A conflicted gitlink is left to the merge.
+                let old_value = old_tree.path_value(path).await?;
+                let Some(old_value) = old_value.as_resolved() else {
+                    continue;
+                };
+                let new_value = match old_value {
+                    Some(TreeValue::GitSubmodule(id)) => Some(TreeValue::GitSubmodule(
+                        rewrites.get(id).unwrap_or(id).clone(),
+                    )),
+                    other => other.clone(),
+                };
+                tree_builder.set_or_remove(path.clone(), new_value);
+            }
+            let tree = tree_builder.write_tree().await?;
+            builder.set_tree(tree).write().await?;
+            num_rebased += 1;
+            Ok(())
+        })
+        .await?;
+    Ok(num_rebased)
 }
 
 /// Whether submodule commit `id` must not be rewritten because a superproject

@@ -2182,17 +2182,70 @@ fn test_git_submodule_rebase() {
     let resolved = gitlink(&work_dir);
     assert_ne!(resolved, conflicted);
 
-    // A conflict in an earlier local commit couldn't be resolved (only the
-    // last one is checked out), so that rebase is refused.
+    // A conflict in the earlier local commit: both superproject commits
+    // follow the rebase, and it is resolved with the earlier one checked out.
     upstream_commit("sub", "upstream\n");
     let output = rebase();
     insta::assert_snapshot!(output, @r#"
     ------- stderr -------
-    Error: Rebasing would leave conflicts in earlier commits of submodule "sub", which can't be resolved yet
+    Rebased 2 commits of submodule "sub"
+    Working copy  (@) now at: 
+    Parent commit (@-)      : edit sub
+    Added 0 files, modified 2 files, removed 0 files
+    Warning: Submodule "sub" now has conflicts; resolve them in its files.
+    Warning: Earlier commits of submodule "sub" have conflicts; edit the commits that point at them (`jj edit`) and resolve them in the submodule's files.
     [EOF]
-    [exit status: 1]
     "#);
-    assert_eq!(gitlink(&work_dir), resolved);
+    work_dir.run_jj(["edit", "@-"]).success();
+    let output = work_dir.run_jj(["status"]);
+    insta::assert_snapshot!(output, @"
+    Working copy changes:
+    M sub
+    Submodules:
+      sub: has conflicts
+    Working copy  (@) : edit sub
+    Parent commit (@-): Add submodule
+    [EOF]
+    ");
+    assert!(read("sub").unwrap().contains("<<<<<<<"));
+    std::fs::write(sub_dir.join("sub"), "merged\n").unwrap();
+    let output = work_dir.run_jj(["status"]);
+    insta::assert_snapshot!(output, @"
+    Working copy changes:
+    M sub
+    Working copy  (@) : edit sub
+    Parent commit (@-): Add submodule
+    [EOF]
+    ------- stderr -------
+    Rebased 1 descendant commits onto updated working copy.
+    [EOF]
+    ");
+    // The later commit was rebased onto the resolution in the submodule.
+    work_dir.run_jj(["next", "--edit"]).success();
+    assert_eq!(read("sub").unwrap(), "merged\n");
+    assert_eq!(read("added").unwrap(), "resolved\n");
+    let output = work_dir.run_jj(["status"]);
+    insta::assert_snapshot!(output, @"
+    Working copy changes:
+    M sub
+    Working copy  (@) : 
+    Parent commit (@-): edit sub
+    [EOF]
+    ");
+    let output = work_dir.run_jj(["log", "-r", "all() & conflicts()"]);
+    insta::assert_snapshot!(output, @"");
+    let tip = gitlink(&work_dir);
+    let output = work_dir.run_jj([
+        "git",
+        "submodule",
+        "log",
+        "sub",
+        "-r",
+        &tip,
+        "-T",
+        "conflict",
+    ]);
+    assert!(output.stdout.raw().contains("false"), "{output}");
 }
 
 /// `jj git submodule describe` and `push` publish snapshot commits to a
@@ -2227,7 +2280,8 @@ fn test_git_submodule_push() {
     // Upstream's commits aren't ours to describe.
     insta::assert_snapshot!(describe(), @r#"
     ------- stderr -------
-    Error: Won't describe commit [id] of submodule "sub" since it is referred to by a parent of the working-copy commit
+    Error: Won't rewrite commit [id] of submodule "sub" since it was not made here
+    Hint: `jj git submodule set sub` can point the gitlink at another commit.
     [EOF]
     [exit status: 1]
     "#);
@@ -2367,16 +2421,6 @@ fn test_git_submodule_push() {
     ------- stderr -------
     Error: Won't rewrite commit [id] of submodule "sub" since it was not made here
     Hint: `jj git submodule set sub` can point the gitlink at another commit.
-    [EOF]
-    [exit status: 1]
-    "#);
-
-    // Once a superproject commit refers to the submodule commit, it is
-    // history.
-    work_dir.run_jj(["commit", "-m", "bump sub"]).success();
-    insta::assert_snapshot!(describe(), @r#"
-    ------- stderr -------
-    Error: Won't describe commit [id] of submodule "sub" since it is referred to by a parent of the working-copy commit
     [EOF]
     [exit status: 1]
     "#);
@@ -2559,4 +2603,102 @@ fn test_git_submodule_immutable_references() {
     std::fs::write(sub_dir.join("sub"), "after release\n").unwrap();
     assert_eq!(parent_of(&gitlink(&work_dir)), released);
     assert_eq!(gitlink_at(&work_dir, "v1"), released);
+}
+
+/// Changes made in a submodule while an earlier superproject commit is checked
+/// out belong to that commit; the later commits follow in both repos.
+#[test]
+fn test_git_submodule_edit_earlier() {
+    let test_env = TestEnvironment::default();
+    let work_dir = set_up_superproject(&test_env);
+    let sub_dir = work_dir.root().join("sub");
+    let read = |name: &str| std::fs::read_to_string(sub_dir.join(name)).ok();
+    let parent_of = |id: &str| submodule_git(&work_dir, &["rev-parse", &format!("{id}^")]);
+    let conflicts = || work_dir.run_jj(["log", "-r", "all() & conflicts()"]);
+    work_dir
+        .run_jj(["git", "submodule", "clone", "sub"])
+        .success();
+    let upstream = gitlink(&work_dir);
+
+    // A commit that doesn't touch the submodule, then two that do.
+    work_dir.write_file("file", "plain\n");
+    work_dir.run_jj(["commit", "-m", "plain"]).success();
+    std::fs::write(sub_dir.join("sub"), "edited\n").unwrap();
+    work_dir.run_jj(["commit", "-m", "first"]).success();
+    std::fs::write(sub_dir.join("added"), "added\n").unwrap();
+    work_dir.run_jj(["describe", "-m", "second"]).success();
+    let (first, second) = (gitlink_at(&work_dir, "@-"), gitlink(&work_dir));
+    assert_eq!(parent_of(&second), first);
+
+    // With `first` checked out, its submodule commit is rewritten in place
+    // and the one of `second` is rebased onto it.
+    work_dir.run_jj(["edit", "@-"]).success();
+    std::fs::write(sub_dir.join("sub"), "edited more\n").unwrap();
+    let output = work_dir.run_jj(["status"]);
+    insta::assert_snapshot!(output, @"
+    Working copy changes:
+    M sub
+    Working copy  (@) : first
+    Parent commit (@-): plain
+    [EOF]
+    ------- stderr -------
+    Rebased 1 descendant commits onto updated working copy.
+    [EOF]
+    ");
+    let first = gitlink(&work_dir);
+    assert_eq!(parent_of(&first), upstream);
+    assert_eq!(parent_of(&gitlink_at(&work_dir, "@+")), first);
+    insta::assert_snapshot!(conflicts(), @"");
+
+    // `plain` has no submodule commit of its own: the change becomes a new
+    // one, below those of the later commits.
+    work_dir.run_jj(["edit", "@-"]).success();
+    std::fs::write(sub_dir.join("below"), "below\n").unwrap();
+    let output = work_dir.run_jj(["status"]);
+    insta::assert_snapshot!(output, @"
+    Working copy changes:
+    A file
+    M sub
+    Working copy  (@) : plain
+    Parent commit (@-): Add submodule
+    [EOF]
+    ------- stderr -------
+    Rebased 2 descendant commits onto updated working copy.
+    [EOF]
+    ");
+    let below = gitlink(&work_dir);
+    assert_eq!(parent_of(&below), upstream);
+    let first = gitlink_at(&work_dir, "@+");
+    assert_eq!(parent_of(&first), below);
+    assert_eq!(parent_of(&gitlink_at(&work_dir, "@++")), first);
+    insta::assert_snapshot!(conflicts(), @"");
+    work_dir.run_jj(["edit", "@++"]).success();
+    let files = ["sub", "added", "below"].map(read);
+    insta::assert_debug_snapshot!(files, @r#"
+    [
+        Some(
+            "edited more\n",
+        ),
+        Some(
+            "added\n",
+        ),
+        Some(
+            "below\n",
+        ),
+    ]
+    "#);
+
+    // After an undo the superproject points at a commit the submodule repo
+    // has hidden; the next change still rewrites it in place.
+    std::fs::write(sub_dir.join("added"), "one\n").unwrap();
+    let one = gitlink(&work_dir);
+    std::fs::write(sub_dir.join("added"), "two\n").unwrap();
+    work_dir.run_jj(["status"]).success();
+    work_dir.run_jj(["undo"]).success();
+    assert_eq!(gitlink(&work_dir), one);
+    std::fs::write(sub_dir.join("added"), "three\n").unwrap();
+    let three = gitlink(&work_dir);
+    assert_ne!(three, one);
+    assert_eq!(parent_of(&three), parent_of(&one));
+    insta::assert_snapshot!(conflicts(), @"");
 }

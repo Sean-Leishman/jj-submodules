@@ -124,9 +124,9 @@ pub struct SubmoduleDeleteArgs {
 ///
 /// Describes the submodule commit the working-copy commit's gitlink points
 /// at, typically a snapshot of changes made in the submodule's directory, and
-/// points the gitlink at the result. Later snapshots keep the description.
-/// Commits that were fetched rather than made here, or that a parent of the
-/// working-copy commit refers to, are not rewritten.
+/// points the gitlink at the result, in every mutable commit that points at
+/// it. Later snapshots keep the description. Commits that were fetched rather
+/// than made here are not rewritten.
 #[derive(clap::Args, Clone, Debug)]
 pub struct SubmoduleDescribeArgs {
     /// Name of the submodule
@@ -788,19 +788,10 @@ async fn cmd_submodule_rebase(
         return Ok(());
     };
     check_submodule_rewrites(&workspace_command, &sub_repo, &config, &rewrites).await?;
-    // ponytail: only the tip is checked out, so only its conflicts can be
-    // resolved. Lifting this needs snapshots made while an earlier
-    // superproject commit is edited to rewrite its submodule commit.
-    let stuck = stats.rebased_commits.values().any(|rebased| match rebased {
+    let earlier_conflicts = stats.rebased_commits.values().any(|rebased| match rebased {
         RebasedCommit::Rewritten(commit) => commit.id() != new_id && commit.has_conflict(),
         RebasedCommit::Abandoned { .. } => false,
     });
-    if stuck {
-        return Err(user_error(format!(
-            "Rebasing would leave conflicts in earlier commits of submodule {name:?}, which \
-             can't be resolved yet"
-        )));
-    }
     tx.commit(format!("rebase submodule commits onto {onto}"))
         .await?;
     writeln!(
@@ -824,6 +815,13 @@ async fn cmd_submodule_rebase(
             "Submodule {name:?} now has conflicts; resolve them in its files."
         )?;
     }
+    if earlier_conflicts {
+        writeln!(
+            ui.warning_default(),
+            "Earlier commits of submodule {name:?} have conflicts; edit the commits that point at \
+             them (`jj edit`) and resolve them in the submodule's files."
+        )?;
+    }
     Ok(())
 }
 
@@ -837,18 +835,6 @@ async fn cmd_submodule_describe(
     let (commit, config, old_id, sub_repo) =
         working_copy_gitlink(ui, command, &workspace_command, name).await?;
     workspace_command.check_rewritable([commit.id()]).await?;
-    // What the superproject's history refers to stays as it is.
-    let old_value = Some(TreeValue::GitSubmodule(old_id.clone()));
-    for parent in commit.parents().await? {
-        let value = parent.tree().path_value(&config.path).await?;
-        if value.iter().contains(&old_value) {
-            return Err(user_error(format!(
-                "Won't describe commit {} of submodule {name:?} since it is referred to by a \
-                 parent of the working-copy commit",
-                short_commit_hash(&old_id)
-            )));
-        }
-    }
     let old_commit = sub_repo.store().get_commit(&old_id)?;
     let description = join_message_paragraphs(&args.message_paragraphs);
     if description == old_commit.description() {

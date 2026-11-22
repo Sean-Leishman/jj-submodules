@@ -2202,7 +2202,7 @@ to the current parents may contain changes from multiple commits.
         // The submodule commits are written here; their operations are
         // published after the superproject's, which refers to them.
         #[cfg(feature = "git")]
-        let (new_tree, submodule_operations) = {
+        let (new_tree, submodule_operations, submodule_rewrites) = {
             let snapshots = match snapshot_submodules {
                 true => locked_ws
                     .locked_wc()
@@ -2212,7 +2212,7 @@ to the current parents may contain changes from multiple commits.
                 false => vec![],
             };
             if snapshots.is_empty() {
-                (new_tree, None)
+                (new_tree, None, HashMap::new())
             } else {
                 let repo = &self.user_repo.repo;
                 let mut protected = HashMap::new();
@@ -2224,17 +2224,18 @@ to the current parents may contain changes from multiple commits.
                         .map_err(snapshot_command_error)?;
                     protected.insert(snapshot.path.clone(), gitlinks);
                 }
-                let (tree, operations) = jj_lib::git_submodule::commit_submodule_snapshots(
+                let outcome = jj_lib::git_submodule::commit_submodule_snapshots(
                     locked_ws.locked_wc(),
                     repo.submodule_store().as_ref(),
                     &workspace_name,
+                    repo.as_ref(),
                     &wc_commit,
                     snapshots,
                     &protected,
                 )
                 .await
                 .map_err(snapshot_command_error)?;
-                (tree, Some(operations))
+                (outcome.tree, Some(outcome.operations), outcome.rewrites)
             }
         };
         #[cfg(not(feature = "git"))]
@@ -2283,10 +2284,26 @@ to the current parents may contain changes from multiple commits.
                 .map_err(snapshot_command_error)?;
 
             // Rebase descendants
-            let num_rebased = mut_repo
-                .rebase_descendants()
+            #[cfg(feature = "git")]
+            let num_followed = match submodule_rewrites.is_empty() {
+                true => 0,
+                // Their gitlinks follow the submodule commits; a plain
+                // rebase would merge them.
+                false => jj_lib::git_submodule::rebase_descendants_following_submodules(
+                    mut_repo,
+                    vec![wc_commit.id().clone()],
+                    &submodule_rewrites,
+                )
                 .await
-                .map_err(snapshot_command_error)?;
+                .map_err(snapshot_command_error)?,
+            };
+            #[cfg(not(feature = "git"))]
+            let num_followed = 0;
+            let num_rebased = num_followed
+                + mut_repo
+                    .rebase_descendants()
+                    .await
+                    .map_err(snapshot_command_error)?;
             if num_rebased > 0 {
                 writeln!(
                     ui.status(),

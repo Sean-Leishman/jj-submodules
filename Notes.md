@@ -712,3 +712,35 @@ Revised split (one commit each, tests in each, docs as they land):
   tagged commit, not a sibling. Use `jj new v1-`.
 - Heuristic limit (in the code as a ponytail note): a submodule pointer that
   moved sideways in immutable history isn't covered.
+
+### 2026-11-22 — follow-rewrites step E: snapshots (plan complete)
+
+- Snapshot rule in `commit_submodule_snapshots()`: rewrite the gitlinked
+  commit in place iff it is ours (`locally_written`), unprotected, no parent
+  of `@` has that gitlink, and everything visible on top of it is ours and
+  unprotected too (a rewrite rebases it all); else new child. The wc pointer
+  in the submodule repo is display-only now.
+- Later superproject commits follow. Their gitlinks (read from `@::` in the
+  superproject) are made visible in the submodule transaction first. Amend:
+  `rebase_descendants_with_options` gives the map. Child: `roots(base..later
+  gitlinks)` and their subtrees move onto the new commit with `move_commits`
+  if all ours. Superproject side:
+  `rebase_descendants_following_submodules()` = normal rebase, then each
+  descendant gets its own (mapped) gitlink back at the submodule path; used
+  by the CLI snapshot in place of plain `rebase_descendants()` when a
+  submodule was snapshotted.
+- So `jj edit <earlier>` + editing submodule files amends that commit's
+  submodule commit (or gives it one), and everything later is carried along
+  in both repos. `rebase` no longer refuses conflicts in earlier commits (it
+  warns and says to `jj edit`), `describe` no longer refuses commits a
+  parent refers to (all mutable commits follow; immutables are protected).
+- Tests: `test_git_submodule_edit_earlier` (amend earlier, child below,
+  undo-then-edit), rebase test now resolves an earlier conflict end to end.
+  1165 CLI tests, 95 lib working-copy tests on 1.97.1.
+- Not done / known: fresh change id when rewriting a hidden commit (the
+  submodule repo gets divergent change ids after undo-then-edit; cosmetic);
+  the first edit on top of an upstream commit walks the whole submodule op
+  log once (`locally_written` miss); per-command cost on bat not re-measured
+  after C–E (the unchanged path is still only the parallel stat walk);
+  `jj status` reports conflicts only for `@`'s submodule commit; merging
+  diverging gitlinks in the tree merge is still the #494 question.
